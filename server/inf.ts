@@ -41,7 +41,7 @@ export const extRegExp = new RegExp(`\\${ext}$$`, 'i');
 // FS-specific), as will 'attr' (so DFS-type .inf files can have attributes
 // written as 'L').
 export async function writeFile(hostPath: string, name: string, load: number, exec: number, attr: string): Promise<void> {
-    let inf = `${name} ${load.toString(16)} ${exec.toString(16)}`;
+    let inf = `${name} ${utils.hex8(load)} ${utils.hex8(exec)}`;
 
     if (attr !== '') {
         inf += ` ${attr}`;
@@ -126,15 +126,11 @@ export async function tryParse(
     } else {
         const infString = utils.getFirstLine(infBuffer);
 
-        if (log !== undefined) {
-            log.p(' - ``' + infString + '\'\'');
-        }
+        log?.p(' - ``' + infString + '\'\'');
 
         const infParts = infString.split(new RegExp('\\s+'));
         if (infParts.length < 3) {
-            if (log !== undefined) {
-                log.pn(' - too few parts');
-            }
+            log?.pn(' - too few parts');
 
             return undefined;
         }
@@ -145,18 +141,14 @@ export async function tryParse(
 
         load = tryParseAddress(infParts[i++]);
         if (load === undefined) {
-            if (log !== undefined) {
-                log.pn(' - invalid load');
-            }
+            log?.pn(' - invalid load');
 
             return undefined;
         }
 
         exec = tryParseAddress(infParts[i++]);
         if (exec === undefined) {
-            if (log !== undefined) {
-                log.pn(' - invalid exec');
-            }
+            log?.pn(' - invalid exec');
 
             return undefined;
         }
@@ -170,9 +162,7 @@ export async function tryParse(
             } else {
                 attr = Number('0x' + infParts[i]);
                 if (Number.isNaN(attr)) {
-                    if (log !== undefined) {
-                        log.pn(' - invalid attributes');
-                    }
+                    log?.pn(' - invalid attributes');
 
                     return undefined;
                 }
@@ -184,9 +174,7 @@ export async function tryParse(
         noINF = false;
     }
 
-    if (log !== undefined) {
-        log.pn(` - load=0x${load.toString(16)} exec=0x${exec.toString(16)} attr=0x${attr.toString(16)}`);
-    }
+    log?.pn(` - load=0x${load.toString(16)} exec=0x${exec.toString(16)} attr=0x${attr.toString(16)}`);
 
     return { hostPath, name, load, exec, attr, noINF };
 }
@@ -206,12 +194,10 @@ export async function getINFsForFolder(hostFolderPath: string, log: utils.Log | 
 
     const beebFileInfos: IINF[] = [];
 
-    if (log !== undefined) {
-        log.pn('getBeebFileInfosForFolder:');
-        log.in(`    `);
-        log.pn(`folder path: ${hostFolderPath}`);
-        log.pn(`.inf regexp: ${extRegExp.source}`);
-    }
+    log?.pn('getBeebFileInfosForFolder:');
+    log?.in(`    `);
+    log?.pn(`folder path: ${hostFolderPath}`);
+    log?.pn(`.inf regexp: ${extRegExp.source}`);
 
     for (const hostName of hostNames) {
         if (extRegExp.exec(hostName) !== null) {
@@ -221,9 +207,7 @@ export async function getINFsForFolder(hostFolderPath: string, log: utils.Log | 
 
         const hostPath = path.join(hostFolderPath, hostName);
 
-        if (log !== undefined) {
-            log.p(`${hostName}: `);
-        }
+        log?.p(`${hostName}: `);
 
         const infBuffer = await utils.tryReadFile(`${hostPath}${ext}`);
 
@@ -235,9 +219,7 @@ export async function getINFsForFolder(hostFolderPath: string, log: utils.Log | 
         beebFileInfos.push(beebFileInfo);
     }
 
-    if (log !== undefined) {
-        log.out();
-    }
+    log?.out();
 
     return beebFileInfos;
 }

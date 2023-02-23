@@ -27,6 +27,7 @@ import * as path from 'path';
 import * as beebfs from './beebfs';
 import * as utils from './utils';
 import * as errors from './errors';
+import * as server from './server';
 
 //////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////
@@ -116,9 +117,9 @@ function mustBePCFSP(fsFSP: beebfs.IFSFSP): PCFSP {
 class PCState implements beebfs.IFSState {
     public readonly volume: beebfs.Volume;
 
-    private readonly log: utils.Log;
+    private readonly log: utils.Log | undefined;// tslint:disable-line no-unused-variable
 
-    public constructor(volume: beebfs.Volume, settings: any | undefined, log: utils.Log) {
+    public constructor(volume: beebfs.Volume, log: utils.Log | undefined) {
         this.volume = volume;
         this.log = log;
     }
@@ -139,12 +140,20 @@ class PCState implements beebfs.IFSState {
         return '';
     }
 
-    public getSettings(): any | undefined {
+    public getTransientSettings(): any | undefined {
         return undefined;
     }
 
-    public getSettingsString(settings: any | undefined): string {
+    public getTransientSettingsString(settings: any | undefined): string {
         return ``;
+    }
+
+    public getPersistentSettings(): any | undefined {
+        return undefined;
+    }
+
+    public getPersistentSettingsString(settings: any | undefined): string {
+        return '';
     }
 
     public async getFileForRUN(fsp: beebfs.FSP, tryLibDir: boolean): Promise<beebfs.File | undefined> {
@@ -154,7 +163,7 @@ class PCState implements beebfs.IFSState {
 
     public async getCAT(commandLine: string | undefined): Promise<string | undefined> {
         if (commandLine === undefined) {
-            return await this.volume.type.getCAT(new beebfs.FSP(this.volume, false, new PCFSP(undefined)), this);
+            return await this.volume.type.getCAT(new beebfs.FSP(this.volume, undefined, new PCFSP(undefined)), this, this.log);
         } else {
             return undefined;
         }
@@ -172,7 +181,7 @@ class PCState implements beebfs.IFSState {
         return notSupported();
     }
 
-    public async starDrives(): Promise<string> {
+    public async getDrivesOutput(): Promise<string> {
         return '';
     }
 
@@ -193,7 +202,7 @@ class PCState implements beebfs.IFSState {
     }
 
     public async readNames(): Promise<string[]> {
-        const files = await this.volume.type.findBeebFilesMatching(this.volume, new PCFSP(undefined), undefined);
+        const files = await this.volume.type.findBeebFilesMatching(this.volume, new PCFSP(undefined), false, undefined);
 
         const names: string[] = [];
         for (const file of files) {
@@ -203,16 +212,20 @@ class PCState implements beebfs.IFSState {
 
         return names;
     }
+
+    public getCommands(): server.Command[] {
+        return [];
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////
 
 class PCType implements beebfs.IFSType {
-    public readonly matchAllFSP: beebfs.IFSFSP = new PCFSP(undefined);
+    public readonly name = 'PC';
 
-    public createState(volume: beebfs.Volume, settings: any | undefined, log: utils.Log): beebfs.IFSState {
-        return new PCState(volume, settings, log);
+    public async createState(volume: beebfs.Volume, transientSettings: any | undefined, persistentSettings: any | undefined, log: utils.Log | undefined): Promise<beebfs.IFSState> {
+        return new PCState(volume, log);
     }
 
     public canWrite(): boolean {
@@ -282,10 +295,12 @@ class PCType implements beebfs.IFSType {
         return pcFQN.name;
     }
 
-    public async findBeebFilesMatching(volume: beebfs.Volume, pattern: beebfs.IFSFQN | beebfs.IFSFSP, log: utils.Log | undefined): Promise<beebfs.File[]> {
+    public async findBeebFilesMatching(volume: beebfs.Volume, pattern: beebfs.IFSFQN | beebfs.IFSFSP | undefined, recurse: boolean, log: utils.Log | undefined): Promise<beebfs.File[]> {
         let nameRegExp: RegExp;
 
-        if (pattern instanceof PCFQN) {
+        if (pattern === undefined) {
+            nameRegExp = utils.getRegExpFromAFSP('*');
+        } else if (pattern instanceof PCFQN) {
             nameRegExp = utils.getRegExpFromAFSP(pattern.name);
         } else if (pattern instanceof PCFSP) {
             if (pattern.name !== undefined) {
@@ -296,6 +311,9 @@ class PCType implements beebfs.IFSType {
         } else {
             throw new Error('not PCFQN or PCFSP');
         }
+
+        // The recursion flag is ignored. PC folders are not (yet?)
+        // hierarchical.
 
         let hostNames: string[];
         try {
@@ -342,12 +360,12 @@ class PCType implements beebfs.IFSType {
         return beebFiles;
     }
 
-    public async getCAT(fsp: beebfs.FSP, state: beebfs.IFSState | undefined): Promise<string> {
+    public async getCAT(fsp: beebfs.FSP, state: beebfs.IFSState | undefined, log: utils.Log | undefined): Promise<string> {
         let text = '';
 
         text += `Volume: ${fsp.volume.path}${utils.BNL}${utils.BNL}`;
 
-        const beebFiles = await this.findBeebFilesMatching(fsp.volume, new PCFSP('*'), undefined);
+        const beebFiles = await this.findBeebFilesMatching(fsp.volume, new PCFSP('*'), false, undefined);
         for (const beebFile of beebFiles) {
             mustBePCFQN(beebFile.fqn.fsFQN);
         }

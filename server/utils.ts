@@ -25,7 +25,6 @@
 import * as fs from 'fs';
 import * as util from 'util';
 import * as os from 'os';
-import { WriteStream } from 'tty';
 import * as path from 'path';
 import { Chalk } from 'chalk';
 import * as beeblink from './beeblink';
@@ -255,6 +254,30 @@ export class BufferReader {
 /////////////////////////////////////////////////////////////////////////
 
 export class Log {
+    // In general, logs can't be enabled or disabled at runtime. So if the log
+    // isn't enabled, it's simply not created.
+    public static create(prefix: string, f: { write(buffer: Buffer | string, cb?: () => void): boolean } | undefined, enabled: boolean = true) {
+        if (enabled) {
+            return new Log(prefix, f, enabled);
+        } else {
+            return undefined;
+        }
+    }
+
+    public static isEnabled(log: Log | undefined): boolean {
+        if (log !== undefined) {
+            return log.enabled;
+        } else {
+            return false;
+        }
+    }
+
+    public static setEnabled(log: Log | undefined, enabled: boolean): void {
+        if (log !== undefined) {
+            log.enabled = enabled;
+        }
+    }
+
     public enabled: boolean;
     public f: { write(buffer: Buffer | string, cb?: () => void): boolean } | undefined;
     public colours: Chalk | undefined;
@@ -654,6 +677,22 @@ export async function tryStat(filePath: string): Promise<fs.Stats | undefined> {
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
+export async function isFolder(folderPath: string): Promise<boolean> {
+    const stat = await tryStat(folderPath);
+    if (stat === undefined) {
+        return false;
+    }
+
+    if (!stat.isDirectory()) {
+        return false;
+    }
+
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
 export async function saveJSON(filePath: string, obj: any): Promise<void> {
     try {
         await fsWriteFile(filePath, JSON.stringify(obj));
@@ -907,3 +946,48 @@ export function getDateString(d: Date): string {
 
     return `${d2(year / 100)}${d2(year)}-${d2(1 + d.getMonth())}-${d2(1 + d.getDate())} ${d2(d.getHours())}:${d2(d.getMinutes())}:${d2(d.getSeconds())}`;
 }
+
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
+export function getBASICStringExpr(text: Buffer): string {
+    let quotes = false;
+    let r = '';
+
+    for (let i = 0; i < text.length; ++i) {
+        const v = text[i];
+        if (v >= 32 && v < 126) {
+            if (!quotes) {
+                if (i > 0) {
+                    r += '+';
+                }
+
+                r += '"';
+                quotes = true;
+            }
+
+            const ch = String.fromCharCode(text[i]);
+            if (ch === '"') {
+                r += '"';
+            }
+
+            r += ch;
+        } else {
+            if (quotes) {
+                r += '"+';
+                quotes = false;
+            } else if (i > 0) {
+                r += '+';
+            }
+
+            r += 'CHR$(' + v + ')';
+        }
+    }
+
+    if (quotes) {
+        r += '"';
+    }
+
+    return r;
+}
+

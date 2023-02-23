@@ -234,7 +234,7 @@ possible the behaviour won't be identical.)
 Lock or unlock file(s). `<mode>` can be blank to unlock, or `L` to
 lock.
 
-### `DEFAULTS ([SFP])`
+### `DEFAULTS ([SF])`
 
 Manage filing system defaults for use after a hard reset (CTRL+BREAK
 or power on).
@@ -250,13 +250,12 @@ current values.
 Use `*DEFAULTS R` - `R` for "reset" - to reset the saved defaults to
 the default defaults.
 
-Use `*DEFAULTS P` - `P` for "print" - to print the current defaults to
-the screen.
-
 This command never affects the current settings - it just selects the
 values to be used after the next hard reset.
 
 The defaults are reset when changing volume.
+
+The `*HSTATUS` output shows the current defaults.
 
 ### `DELETE <fsp>` (*B/B+*)
 
@@ -270,17 +269,17 @@ Change directory and/or drive on the current volume.
 
 Change drive on the current volume.
 
-### `DRIVES`
-
-Show the list of drives in the current volume.
-
 ### `DUMP <fsp>` (*B/B+*)
 
 Produce hex dump of file.
 
-### `FILES`
+### `HSTATUS ([HFD]+)`
 
-Show the list of currently open files.
+Show current status: general info (current volume, current defaults),
+currently open files, and currently available drives.
+
+Supply codes on the command line to restrict the output: `H` to show
+the status, `F` to show open files, and `D` to show drives.
 
 ### `INFO <afsp>` (*B/B+*)
 

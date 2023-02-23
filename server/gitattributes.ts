@@ -31,14 +31,13 @@ import * as beebfs from './beebfs';
 
 export class Manipulator {
     private queue: (() => Promise<void>)[];
-    private log: utils.Log;
+    private log: utils.Log | undefined;
     private extraVerbose: boolean = false;
     private quiescentCallbacks: (() => void)[];
-    private completionMessage: string | undefined;
 
     public constructor(verbose: boolean) {
         this.queue = [];
-        this.log = new utils.Log('.gitattributes', process.stderr, verbose);
+        this.log = utils.Log.create('.gitattributes', process.stderr, verbose);
         this.quiescentCallbacks = [];
     }
 
@@ -83,9 +82,9 @@ export class Manipulator {
         }
 
         this.push(async (): Promise<void> => {
-            const beebFiles = await volume.type.findBeebFilesMatching(volume, volume.type.matchAllFSP, undefined);
+            const beebFiles = await volume.type.findBeebFilesMatching(volume, undefined, true, undefined);
 
-            //this.log.pn(path.join(drive.volumePath, drive.name) + ': ' + beebFiles.length + ' Beeb file(s)\n');
+            //this.log?.pn(path.join(drive.volumePath, drive.name) + ': ' + beebFiles.length + ' Beeb file(s)\n');
 
             for (const beebFile of beebFiles) {
                 const data = await utils.tryReadFile(beebFile.hostPath);
@@ -95,7 +94,7 @@ export class Manipulator {
 
                 const isBASIC = utils.isBASIC(data);
 
-                //this.log.pn(beebFile.hostPath + ': is BASIC: ' + (isBASIC ? 'yes' : 'no'));
+                //this.log?.pn(beebFile.hostPath + ': is BASIC: ' + (isBASIC ? 'yes' : 'no'));
 
                 this.makeFileBASIC(beebFile.hostPath, isBASIC);
             }
@@ -105,17 +104,17 @@ export class Manipulator {
     private change(filePath: string, remove: string | undefined, add: string | undefined): void {
         this.push(async (): Promise<void> => {
             if (this.extraVerbose) {
-                this.log.p('change: filePath=``' + filePath + '\'\': ');
+                this.log?.p('change: filePath=``' + filePath + '\'\': ');
 
                 if (remove !== undefined) {
-                    this.log.p(' remove ``' + remove + '\'\'');
+                    this.log?.p(' remove ``' + remove + '\'\'');
                 }
 
                 if (add !== undefined) {
-                    this.log.p(' add ``' + add + '\'\'');
+                    this.log?.p(' add ``' + add + '\'\'');
                 }
 
-                this.log.p('\n');
+                this.log?.p('\n');
             }
 
             const gaPath = path.join(path.dirname(filePath), '.gitattributes');
@@ -123,7 +122,7 @@ export class Manipulator {
             let basename = path.basename(filePath);
 
             if (basename.length === 0) {
-                this.log.pn('(basename.length === 0)');
+                this.log?.pn('(basename.length === 0)');
                 return;
             }
 
@@ -136,7 +135,7 @@ export class Manipulator {
             if (gaData === undefined) {
                 if (add === undefined) {
                     // it's ok, nothing to do.
-                    this.log.pn('(nothing to do)');
+                    this.log?.pn('(nothing to do)');
                     return;
                 }
 
@@ -148,7 +147,7 @@ export class Manipulator {
             const spacesRE = new RegExp('\\s+');
 
             let added = false;
-            let removed = false;
+            let removed = false;// tslint:disable-line no-unused-variable
             let fileChanged = false;
 
             let lineIdx = 0;
@@ -217,28 +216,28 @@ export class Manipulator {
             }
 
             if (gaLines.length === 0) {
-                this.log.pn('Deleting: ' + gaPath);
+                this.log?.pn('Deleting: ' + gaPath);
                 try {
                     await utils.forceFsUnlink(gaPath);
                 } catch (error) {
-                    this.log.pn('Failed to delete ``' + gaPath + '\'\': ' + error);
+                    this.log?.pn('Failed to delete ``' + gaPath + '\'\': ' + error);
                 }
             } else if (fileChanged) {
-                this.log.pn('Updating: ' + gaPath);
+                this.log?.pn('Updating: ' + gaPath);
 
                 if (remove !== undefined) {
-                    this.log.pn('    (Removing: ' + basename + ' ' + remove + ')');
+                    this.log?.pn('    (Removing: ' + basename + ' ' + remove + ')');
                 }
 
                 if (add !== undefined && added) {
-                    this.log.pn('    (Adding: ' + basename + ' ' + add + ')');
+                    this.log?.pn('    (Adding: ' + basename + ' ' + add + ')');
                 }
 
                 try {
                     const gaNewData = Buffer.from(gaLines.join('\n'), 'utf-8') + '\n';
                     await utils.fsWriteFile(gaPath, gaNewData);
                 } catch (error) {
-                    this.log.pn('Failed to write to ``' + gaPath + '\'\': ' + error);
+                    this.log?.pn('Failed to write to ``' + gaPath + '\'\': ' + error);
                 }
             }
         });
@@ -261,7 +260,7 @@ export class Manipulator {
             this.queue[0]().then(() => {
                 this.next();
             }).catch((error) => {
-                this.log.pn('Error: ' + error);
+                this.log?.pn('Error: ' + error);
                 this.next();
             });
         } else {

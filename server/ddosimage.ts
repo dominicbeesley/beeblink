@@ -25,7 +25,6 @@
 import * as utils from './utils';
 import * as beebfs from './beebfs';
 import * as errors from './errors';
-import * as server from './server';
 import * as diskimage from './diskimage';
 import * as dfsimage from './dfsimage';
 
@@ -48,9 +47,7 @@ function getNumTracks(image: Buffer, track0Offset: number): number {
 // Maybe one day I'll fill this in properly... 
 function getUsedTracks(image: Buffer, track0Offset: number, log: utils.Log | undefined): number[] {
     const numTracks = getNumTracks(image, track0Offset);
-    // if (log !== undefined) {
-    //     log.pn(`${numTracks} tracks`);
-    // }
+    //     log?.pn(`${numTracks} tracks`);
 
     const usedTracks: number[] = [];
     for (let i = 0; i < numTracks; ++i) {

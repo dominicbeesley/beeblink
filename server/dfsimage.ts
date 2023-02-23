@@ -25,7 +25,6 @@
 import * as utils from './utils';
 import * as beebfs from './beebfs';
 import * as errors from './errors';
-import * as server from './server';
 import * as diskimage from './diskimage';
 
 //////////////////////////////////////////////////////////////////////////
@@ -106,9 +105,7 @@ function getUsedTracks(data: Buffer, track0Offset: number, allSectors: boolean, 
 
         usedTracks.sort();
 
-        // if (log !== undefined) {
-        //     log.pn(`Used tracks: ${usedTracks}`);
-        // }
+        //     log?.pn(`Used tracks: ${usedTracks}`);
 
         return usedTracks;
     }
@@ -385,11 +382,9 @@ export class ReadFlow extends diskimage.Flow {
             return errors.generic(`Invalid setCat`);
         }
 
-        if (this.log !== undefined) {
-            this.log.withIndent('cat: ', () => {
-                this.log!.dumpBuffer(p);
-            });
-        }
+        this.log?.withIndent('cat: ', () => {
+            this.log!.dumpBuffer(p);
+        });
 
         this.tracks = [];
 
@@ -429,9 +424,7 @@ export class ReadFlow extends diskimage.Flow {
             this.image = Buffer.alloc(numTracks * TRACK_SIZE_BYTES);
         }
 
-        if (this.log !== undefined) {
-            this.log.pn(`${this.tracks.length} part(s)`);
-        }
+        this.log?.pn(`${this.tracks.length} part(s)`);
     }
 
     public getNextPart(): diskimage.IPart | undefined {

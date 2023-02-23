@@ -23,25 +23,21 @@
 //////////////////////////////////////////////////////////////////////////
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { DEFAULT_FIRST_FILE_HANDLE, DEFAULT_NUM_FILE_HANDLES } from './beeblink';
 import * as utils from './utils';
-import { Chalk } from 'chalk';
 import * as gitattributes from './gitattributes';
 import * as errors from './errors';
 import CommandLine from './CommandLine';
-import * as inf from './inf';
 import dfsType from './dfsType';
 import pcType from './pcType';
+import tubeHostType from './tubeHostType';
+import * as server from './server';
 
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
-const MAX_NUM_DRIVES = 8;
 export const MAX_FILE_SIZE = 0xffffff;
-
-const MIN_FILE_HANDLE = 0xa0;
 
 export const SHOULDNT_LOAD = 0xffffffff;
 export const SHOULDNT_EXEC = 0xffffffff;
@@ -191,7 +187,7 @@ export class File {
     }
 
     public toString(): string {
-        return 'BeebFile(hostPath=``' + this.hostPath + '\'\' name=``' + this.fqn + '\'\' load=0x' + utils.hex8(this.load) + ' exec=0x' + utils.hex8(this.exec) + ' attr=0x' + utils.hex8(this.attr);
+        return 'File(hostPath=``' + this.hostPath + '\'\' name=``' + this.fqn + '\'\' load=0x' + utils.hex8(this.load) + ' exec=0x' + utils.hex8(this.exec) + ' attr=0x' + utils.hex8(this.attr);
     }
 }
 
@@ -279,20 +275,25 @@ export class FSP {
     // Volume this FSP refers to.
     public readonly volume: Volume;
 
-    // set to true if the ::VOLUME syntax was used to specify the volume.
-    public readonly wasExplicitVolume: boolean;
+    // If the volume refers to one that's currently set, state is the state
+    // associated with it; if undefined, the ::VOLUME syntax was used.
+    public readonly state: IFSState | undefined;
 
     // FS-specific portion of the FSP.
     public readonly fsFSP: IFSFSP;
 
-    public constructor(volume: Volume, wasExplicitVolume: boolean, name: IFSFSP) {
+    public constructor(volume: Volume, state: IFSState | undefined, name: IFSFSP) {
         this.volume = volume;
-        this.wasExplicitVolume = wasExplicitVolume;
+        this.state = state;
         this.fsFSP = name;
     }
 
     public toString(): string {
         return `::${this.volume.name}${this.fsFSP}`;
+    }
+
+    public wasExplicitVolume(): boolean {
+        return this.state === undefined;
     }
 }
 
@@ -354,26 +355,42 @@ export async function writeFile(filePath: string, data: Buffer): Promise<void> {
 export interface IFSState {
     readonly volume: Volume;
 
-    // get current drive.
+    // get current drive. (OSGBPB 6 reads this, so it's part of the standard
+    // interface.)
     getCurrentDrive(): string;
 
-    // get current directory.
+    // get current directory. (OSGBPB 6 reads this, so it's part of the standard
+    // interface.)
     getCurrentDir(): string;
 
-    // get library drive.
+    // get library drive. (OSGBPB 7 reads this, so it's part of the standard
+    // interface.)
     getLibraryDrive(): string;
 
-    // get library directory.
+    // get library directory. (OSGBPB 7 reads this, so it's part of the standard
+    // interface.)
     getLibraryDir(): string;
 
-    // get object holding current settings - drives and dirs and whatever else.
-    // Use when recreating the state, to restore the current settings.
+    // get object holding current transient settings that would be reset on
+    // Ctrl+Break - drive/dir, lib drive/dir, and so on. Use when recreating the
+    // state, to restore the current settings.
     //
     // The naming is crappy because 'state' was already taken.
-    getSettings(): any | undefined;
+    getTransientSettings(): any | undefined;
 
-    // get text description of settings as returned by getSettings.
-    getSettingsString(settings: any | undefined): string;
+    // turns transient settings into a human-readable string for printing on the
+    // Beeb. This isn't a toString on an interface type, so the FS state has the
+    // option of printing something useful out when there's no state.
+    getTransientSettingsString(transientSettings: any | undefined): string;
+
+    // get object holding current persistent settings, that would not be reset
+    // on Ctrl+Break - drive assignments, and so on. Use when recreating the
+    // state, to restore the current settings.
+    getPersistentSettings(): any | undefined;
+
+    // turns persistent settings into a human-readable string for printing on
+    // the Beeb.
+    getPersistentSettingsString(persistentSettings: any | undefined): string;
 
     // get file to use for *RUN. If tryLibDir is false, definitely don't try lib
     // drive/directory.
@@ -398,8 +415,8 @@ export interface IFSState {
     // handle *LIB.
     starLib(fsp: FSP | undefined): void;
 
-    // handle *DRIVES.
-    starDrives(): Promise<string>;
+    // handle *HSTATUS drives output.
+    getDrivesOutput(): Promise<string>;
 
     // read boot option, for OSGBPB 5 or SHIFT+BREAK.
     getBootOption(): Promise<number>;
@@ -415,6 +432,12 @@ export interface IFSState {
 
     // read names, for OSGBPB 6.
     readNames(): Promise<string[]>;
+
+    // return list of type-specific commands.
+    //
+    // This is only called when the FS type potentially changes, so it's OK if
+    // it does something expensive.
+    getCommands(): server.Command[];
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -423,12 +446,10 @@ export interface IFSState {
 // Handle FS-specific stuff that doesn't require any state.
 
 export interface IFSType {
-    // a IFSFP for use with findBeebFilesMatching that will match all files in
-    // the volume.
-    readonly matchAllFSP: IFSFSP;
+    readonly name: string;
 
     // create new state for this type of FS.
-    createState(volume: Volume, state: any | undefined, log: utils.Log): IFSState;
+    createState(volume: Volume, transientSettings: any | undefined, persistentSettings: any | undefined, log: utils.Log | undefined): Promise<IFSState>;
 
     // whether this FS supports writing.
     canWrite(): boolean;
@@ -440,8 +461,8 @@ export interface IFSType {
 
     // get list of Beeb files matching the given FSP/FQN in the given volume. If
     // an FQN, do a wildcard match; if an FSP, same, treating any undefined
-    // values as matching anything.
-    findBeebFilesMatching(volume: Volume, pattern: IFSFSP | IFSFQN, log: utils.Log | undefined): Promise<File[]>;
+    // values as matching anything; if undefined, find absolutely everything.
+    findBeebFilesMatching(volume: Volume, pattern: IFSFSP | IFSFQN | undefined, recurse: boolean, log: utils.Log | undefined): Promise<File[]>;
 
     // parse file/dir string, starting at index i. 
     parseFileOrDirString(str: string, i: number, parseAsDir: boolean): IFSFSP;
@@ -454,7 +475,7 @@ export interface IFSType {
     getHostPath(fqn: IFSFQN): string;
 
     // get *CAT text for FSP.
-    getCAT(fsp: FSP, state: IFSState | undefined): Promise<string>;
+    getCAT(fsp: FSP, state: IFSState | undefined, log: utils.Log | undefined): Promise<string>;
 
     // delete the given file.
     deleteFile(file: File): Promise<void>;
@@ -487,6 +508,9 @@ export interface IFSType {
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
+// Name as supplied by caller. Properties may be undefined if they weren't
+// provided.
+//
 // explicitly mentioning toString avoids the no-empty-interface tslint warning
 // (that I haven't decided what to do about yet).
 export interface IFSFSP {
@@ -513,10 +537,8 @@ export interface IFSFQN {
 //
 // If throwIfNotFound, wil throw FileNotFound if the file isn't found -
 // otherwise, return undefined.
-export async function getBeebFile(fqn: FQN, wildcardsOK: boolean, throwIfNotFound: boolean, log?: utils.Log): Promise<File | undefined> {
-    if (log !== undefined) {
-        log.pn(`getBeebFile: ${fqn}; wildCardsOK=${wildcardsOK} throwIfNotFound=${throwIfNotFound}`);
-    }
+export async function getBeebFile(fqn: FQN, wildcardsOK: boolean, throwIfNotFound: boolean, log?: utils.Log | undefined): Promise<File | undefined> {
+    log?.pn(`getBeebFile: ${fqn}; wildCardsOK=${wildcardsOK} throwIfNotFound=${throwIfNotFound}`);
 
     if (!wildcardsOK) {
         if (fqn.fsFQN.isWildcard()) {
@@ -524,10 +546,8 @@ export async function getBeebFile(fqn: FQN, wildcardsOK: boolean, throwIfNotFoun
         }
     }
 
-    const files = await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, log);
-    if (log !== undefined) {
-        log.pn(`found ${files.length} file(s)`);
-    }
+    const files = await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, false, log);
+    log?.pn(`found ${files.length} file(s)`);
 
     if (files.length === 0) {
         if (throwIfNotFound) {
@@ -545,13 +565,32 @@ export async function getBeebFile(fqn: FQN, wildcardsOK: boolean, throwIfNotFoun
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
+export interface IFSSearchFolders {
+    // Folders to search for BeebLink volumes.
+    beebLinkSearchFolders: string[];
+
+    // Folders to use as PC volumes.
+    pcFolders: string[];
+
+    // Folders to use as TubeHost volumes.
+    tubeHostFolders: string[];
+
+    // Regexps of folders to exclude when searching. (This is a bit of a hack,
+    // for use when I'm testing stuff and it's annoying having loads of
+    // volumes...)
+    pathExcludeRegExps: RegExp[];
+}
+
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
 export class FS {
 
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public static async findAllVolumes(folders: string[], pcFolders: string[], log: utils.Log | undefined): Promise<Volume[]> {
-        return await FS.findVolumes('*', false, folders, pcFolders, log);
+    public static async findAllVolumes(searchFolders: IFSSearchFolders, log: utils.Log | undefined): Promise<Volume[]> {
+        return await FS.findVolumes('*', false, searchFolders, log);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -617,16 +656,36 @@ export class FS {
     // should go away?
     //
     // If findFirstMatchingVolume is true, the search will early out once the
-    // result clear: that is, is if the voume spec is unambiguous, when the
-    // first matching volume is found, or, if the volume spec is ambiguous, when
-    // the second matching volume is found.
-    private static async findVolumes(afsp: string, findFirstMatchingVolume: boolean, folders: string[], pcFolders: string[], log: utils.Log | undefined): Promise<Volume[]> {
+    // result is clear: that is, is if the volume spec is unambiguous, when the
+    // first matching volume is found, indicating the search is complete; or, if
+    // the volume spec is ambiguous, when the second matching volume is found,
+    // indicating the search is ambiguous.
+    private static async findVolumes(afsp: string, findFirstMatchingVolume: boolean, searchFolders: IFSSearchFolders, log: utils.Log | undefined): Promise<Volume[]> {
         const volumes: Volume[] = [];
 
-        const re = utils.getRegExpFromAFSP(afsp);
+        const volumeNameRegExp = utils.getRegExpFromAFSP(afsp);
         const ambiguous = utils.isAmbiguousAFSP(afsp);
 
-        function isDone(): boolean {
+        // Adds volume with given properties, if it looks valid and fulfils the criteria.
+        //
+        // Returns true if the find process should finish early.
+        function addVolume(volumePath: string, volumeName: string, volumeType: IFSType): boolean {
+            if (!FS.isValidVolumeName(volumeName)) {
+                return false;
+            }
+
+            if (volumeNameRegExp.exec(volumeName) === null) {
+                return false;
+            }
+
+            for (const regExp of searchFolders.pathExcludeRegExps) {
+                if (regExp.exec(volumePath) !== null) {
+                    return false;
+                }
+            }
+
+            volumes.push(new Volume(volumePath, volumeName, volumeType));
+
             if (findFirstMatchingVolume) {
                 if (ambiguous) {
                     if (volumes.length === 2) {
@@ -642,20 +701,15 @@ export class FS {
             return false;
         }
 
-        // returns true if 
-        async function findVolumesMatchingRecursive(folderPath: string, indent: string): Promise<boolean> {
-            if (log !== undefined) {
-                log.pn(indent + 'Looking in: ' + folderPath + '...');
-            }
+        async function findBeebLinkVolumesMatchingRecursive(folderPath: string, indent: string): Promise<boolean> {
+            log?.pn(indent + 'Looking in: ' + folderPath + '...');
 
             let names: string[];
             try {
                 names = await utils.fsReaddir(folderPath);
             } catch (error) {
                 process.stderr.write('WARNING: failed to read files in folder: ' + folderPath + '\n');
-                if (log !== undefined) {
-                    log.pn('Error was: ' + error);
-                }
+                log?.pn('Error was: ' + error);
                 return false;
             }
 
@@ -675,43 +729,32 @@ export class FS {
                         continue;
                     }
 
-                    const fullName = path.join(folderPath, name);
+                    const volumePath = path.join(folderPath, name);
 
-                    const stat = await utils.tryStat(fullName);
+                    const stat = await utils.tryStat(volumePath);
                     if (stat !== undefined && stat.isDirectory()) {
-                        const stat0 = await utils.tryStat(path.join(fullName, '0'));
+                        const stat0 = await utils.tryStat(path.join(volumePath, '0'));
                         if (stat0 === undefined) {
                             // obviously not a BeebLink volume, so save for later.
-                            subfolderPaths.push(fullName);
+                            subfolderPaths.push(volumePath);
                         } else if (stat0.isDirectory()) {
                             let volumeName: string;
-                            const buffer = await utils.tryReadFile(path.join(fullName, VOLUME_FILE_NAME));
+                            const buffer = await utils.tryReadFile(path.join(volumePath, VOLUME_FILE_NAME));
                             if (buffer !== undefined) {
                                 volumeName = utils.getFirstLine(buffer);
                             } else {
                                 volumeName = name;
                             }
 
-                            if (FS.isValidVolumeName(volumeName)) {
-                                const volume = new Volume(fullName, volumeName, dfsType);
-                                if (log !== undefined) {
-                                    log.pn('Found volume ' + volume.path + ': ' + volume.name);
-                                }
-
-                                if (re.exec(volume.name) !== null) {
-                                    volumes.push(volume);
-
-                                    if (isDone()) {
-                                        return true;
-                                    }
-                                }
+                            if (addVolume(volumePath, volumeName, dfsType)) {
+                                return true;
                             }
                         }
                     }
                 }
 
                 for (const subfolderPath of subfolderPaths) {
-                    if (await findVolumesMatchingRecursive(subfolderPath, indent + '    ')) {
+                    if (await findBeebLinkVolumesMatchingRecursive(subfolderPath, indent + '    ')) {
                         return true;
                     }
                 }
@@ -720,24 +763,29 @@ export class FS {
             return false;
         }
 
-        for (const folder of folders) {
-            if (await findVolumesMatchingRecursive(folder, '')) {
+        for (const folder of searchFolders.beebLinkSearchFolders) {
+            if (await findBeebLinkVolumesMatchingRecursive(folder, '')) {
                 return volumes;
             }
         }
 
-        for (const pcFolder of pcFolders) {
-            const volumeName = path.basename(pcFolder);
-            if (FS.isValidVolumeName(volumeName)) {
-                if (re.exec(volumeName) !== null) {
-                    const volume = new Volume(pcFolder, volumeName, pcType);
-                    volumes.push(volume);
-
-                    if (isDone()) {
-                        return volumes;
-                    }
+        // returns true if done.
+        function addFolders(folders: string[], type: IFSType): boolean {
+            for (const folder of folders) {
+                if (addVolume(folder, path.basename(folder), type)) {
+                    return true;
                 }
             }
+
+            return false;
+        }
+
+        if (addFolders(searchFolders.pcFolders, pcType)) {
+            return volumes;
+        }
+
+        if (addFolders(searchFolders.tubeHostFolders, tubeHostType)) {
+            return volumes;
         }
 
         return volumes;
@@ -772,37 +820,30 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    private static isValidFileNameChar(char: string) {
-        const c = char.charCodeAt(0);
-        return c >= 32 && c < 127;
-    }
-
-    /////////////////////////////////////////////////////////////////////////
-    /////////////////////////////////////////////////////////////////////////
-
-    private folders: string[];
-    private pcFolders: string[];
+    private searchFolders: IFSSearchFolders;
 
     //private currentVolume: BeebVolume | undefined;
 
     private firstFileHandle: number;
     private openFiles: (OpenFile | undefined)[];
 
-    private log: utils.Log;
+    private log: utils.Log | undefined;
 
     private state: IFSState | undefined;
-    private defaults: any | undefined;
+    private stateCommands: undefined | server.Command[];
+    private defaultTransientSettings: any | undefined;
 
     private gaManipulator: gitattributes.Manipulator | undefined;
 
+    private locateVerbose: boolean;
+
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public constructor(folders: string[], pcFolders: string[], gaManipulator: gitattributes.Manipulator | undefined, log: utils.Log) {
+    public constructor(searchFolders: IFSSearchFolders, gaManipulator: gitattributes.Manipulator | undefined, log: utils.Log | undefined, locateVerbose: boolean) {
         this.log = log;
 
-        this.folders = folders.slice();
-        this.pcFolders = pcFolders.slice();
+        this.searchFolders = searchFolders;
 
         //this.resetDirs();
 
@@ -813,6 +854,22 @@ export class FS {
         }
 
         this.gaManipulator = gaManipulator;
+        this.locateVerbose = locateVerbose;
+    }
+
+    /////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////////////////////////////////////////////
+
+    public getCommands(): server.Command[] {
+        if (this.stateCommands === undefined) {
+            if (this.state === undefined) {
+                return [];
+            }
+
+            this.stateCommands = this.state.getCommands();
+        }
+
+        return this.stateCommands;
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -839,7 +896,7 @@ export class FS {
             }
         }
 
-        this.state = volume.type.createState(volume, undefined, this.log);
+        this.setState(await volume.type.createState(volume, undefined, undefined, this.log));
         this.resetDefaults();
     }
 
@@ -857,7 +914,7 @@ export class FS {
         if (this.state === undefined) {
             return errors.discFault('No volume');
         } else {
-            this.defaults = this.state.getSettings();
+            this.defaultTransientSettings = this.state.getTransientSettings();
         }
     }
 
@@ -865,7 +922,7 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public resetDefaults(): void {
-        this.defaults = undefined;
+        this.defaultTransientSettings = undefined;
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -875,7 +932,7 @@ export class FS {
         if (this.state === undefined) {
             return errors.discFault('No volume');
         } else {
-            return this.state.getSettingsString(this.defaults);
+            return this.state.getTransientSettingsString(this.defaultTransientSettings);
         }
     }
 
@@ -885,7 +942,8 @@ export class FS {
     // Reset dirs and close open files.
     public async reset() {
         if (this.state !== undefined) {
-            this.state = this.state.volume.type.createState(this.state.volume, this.defaults, this.log);
+            const persistentSettings = this.state.getPersistentSettings();
+            this.setState(await this.state.volume.type.createState(this.state.volume, this.defaultTransientSettings, persistentSettings, this.log));
         }
 
         await this.OSFINDClose(0);
@@ -918,7 +976,7 @@ export class FS {
         if (arg !== undefined) {
             fsp = await this.parseDirString(arg);
 
-            if (fsp.wasExplicitVolume) {
+            if (fsp.wasExplicitVolume()) {
                 await this.mount(fsp.volume);
             }
         }
@@ -935,7 +993,7 @@ export class FS {
         if (arg !== undefined) {
             fsp = await this.parseDirString(arg);
 
-            if (fsp.wasExplicitVolume) {
+            if (fsp.wasExplicitVolume()) {
                 return errors.badDir();
             }
         }
@@ -946,8 +1004,8 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public async starDrives(): Promise<string> {
-        return await this.getState().starDrives();
+    public async getDrivesOutput(): Promise<string> {
+        return await this.getState().getDrivesOutput();
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -955,7 +1013,7 @@ export class FS {
 
     // Finds all volumes matching the given afsp.
     public async findAllVolumesMatching(afsp: string): Promise<Volume[]> {
-        return await FS.findVolumes(afsp, false, this.folders, this.pcFolders, undefined);
+        return await FS.findVolumes(afsp, false, this.searchFolders, undefined);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -966,7 +1024,7 @@ export class FS {
     // If afsp is ambiguous, finds single volume matching it, or two volumes
     // that match it (no matter how many other volumes might also match).
     public async findFirstVolumeMatching(afsp: string): Promise<Volume[]> {
-        return await FS.findVolumes(afsp, true, this.folders, this.pcFolders, undefined);
+        return await FS.findVolumes(afsp, true, this.searchFolders, undefined);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -978,7 +1036,7 @@ export class FS {
         }
 
         // This check is a bit crude, but should catch obvious problems...
-        const volumePath = path.join(this.folders[0], name);
+        const volumePath = path.join(this.searchFolders.beebLinkSearchFolders[0], name);
         try {
             const stat0 = await utils.fsStat(path.join(volumePath, '0'));
             if (stat0.isDirectory()) {
@@ -1010,13 +1068,13 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async parseFQN(fileString: string): Promise<FQN> {
-        this.log.pn('parseFQN: ``' + fileString + '\'\'');
+        this.log?.pn('parseFQN: ``' + fileString + '\'\'');
 
         const fsp = await this.parseFileString(fileString);
-        this.log.pn('    fsp: ' + fsp);
+        this.log?.pn('    fsp: ' + fsp);
 
         const fqn = new FQN(fsp.volume, fsp.volume.type.createFQN(fsp.fsFSP, this.state));
-        this.log.pn(`    fqn: ${fqn}`);
+        this.log?.pn(`    fqn: ${fqn}`);
 
         return fqn;
     }
@@ -1025,7 +1083,7 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async findFilesMatching(fqn: FQN): Promise<File[]> {
-        return await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, this.log);
+        return await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, false, this.log);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1065,20 +1123,40 @@ export class FS {
 
         const foundFiles: File[] = [];
 
-        for (const volume of volumes) {
-            let fsp: IFSFSP;
-            try {
-                fsp = volume.type.parseFileOrDirString(arg, 0, false);
-            } catch (error) {
-                // if the arg wasn't even parseable by this volume's type, it
-                // presumably won't match any file...
-                continue;
+        if (this.locateVerbose) {
+            this.log?.pn(`starLocate: arg=\`\`${arg}''`);
+        }
+
+        for (let volumeIdx = 0; volumeIdx < volumes.length; ++volumeIdx) {
+            const volume = volumes[volumeIdx];
+
+            if (this.locateVerbose) {
+                this.log?.pn(`Volume ${1 + volumeIdx}/${volumes.length}: ${volume.name}: ${volume.path}`);
             }
 
-            const files = await volume.type.findBeebFilesMatching(volume, fsp, undefined);
+            try {
+                if (this.locateVerbose) {
+                    this.log?.in('  ');
+                }
 
-            for (const file of files) {
-                foundFiles.push(file);
+                let fsp: IFSFSP;
+                try {
+                    fsp = volume.type.parseFileOrDirString(arg, 0, false);
+                } catch (error) {
+                    // if the arg wasn't even parseable by this volume's type, it
+                    // presumably won't match any file...
+                    continue;
+                }
+
+                const files = await volume.type.findBeebFilesMatching(volume, fsp, true, this.locateVerbose ? this.log : undefined);
+
+                for (const file of files) {
+                    foundFiles.push(file);
+                }
+            } finally {
+                if (this.locateVerbose) {
+                    this.log?.out();
+                }
             }
         }
 
@@ -1139,7 +1217,7 @@ export class FS {
         }
 
         if (!anyOpen) {
-            text += 'No files open.' + utils.BNL;
+            text += 'No files open' + utils.BNL;
         }
 
         return text;
@@ -1161,7 +1239,7 @@ export class FS {
 
         const fsp = await this.parseDirString(commandLine);
 
-        return await fsp.volume.type.getCAT(fsp, this.getState());
+        return await fsp.volume.type.getCAT(fsp, this.getState(), this.log);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1272,7 +1350,7 @@ export class FS {
             return errors.badName();
         }
 
-        this.log.pn('OSFIND: mode=$' + utils.hex2(mode) + ' nameString=``' + nameString + '\'\'');
+        this.log?.pn('OSFIND: mode=$' + utils.hex2(mode) + ' nameString=``' + nameString + '\'\'');
 
         const index = this.openFiles.indexOf(undefined);
         if (index < 0) {
@@ -1295,7 +1373,7 @@ export class FS {
                     if (otherOpenFile !== undefined) {
                         if (otherOpenFile.hostPath === file.hostPath) {
                             if (otherOpenFile.write || write) {
-                                this.log.pn(`        already open: handle=0x${this.firstFileHandle + otherIndex}`);
+                                this.log?.pn(`        already open: handle=0x${this.firstFileHandle + otherIndex}`);
                                 return errors.open();
                             }
                         }
@@ -1303,8 +1381,8 @@ export class FS {
                 }
             }
 
-            this.log.pn('        hostPath=``' + file.hostPath + '\'\'');
-            this.log.pn('        text=' + file.text);
+            this.log?.pn('        hostPath=``' + file.hostPath + '\'\'');
+            this.log?.pn('        text=' + file.text);
 
             // File exists.
             hostPath = file.hostPath;
@@ -1359,7 +1437,7 @@ export class FS {
 
         const openFile = new OpenFile(this.firstFileHandle + index, hostPath, fqn, read, write, contents);
         this.openFiles[index] = openFile;
-        this.log.pn(`        handle=0x${openFile.handle}`);
+        this.log?.pn(`        handle=0x${openFile.handle}`);
         return openFile.handle;
     }
 
@@ -1510,8 +1588,8 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async rename(oldFQN: FQN, newFQN: FQN): Promise<void> {
-        this.log.pn('oldFQN: ' + oldFQN);
-        this.log.pn('newFQN: ' + newFQN);
+        this.log?.pn('oldFQN: ' + oldFQN);
+        this.log?.pn('newFQN: ' + newFQN);
 
         if (!oldFQN.volume.equals(newFQN.volume)) {
             return errors.badDrive();
@@ -1540,7 +1618,12 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async getFileForRUN(fsp: FSP, tryLibDir: boolean): Promise<File> {
-        const file = await this.getState().getFileForRUN(fsp, !fsp.wasExplicitVolume);
+        if (fsp.wasExplicitVolume()) {
+            // Definitely don't try lib drive/dir if volume was specified.
+            tryLibDir = false;
+        }
+
+        const file = await this.getState().getFileForRUN(fsp, tryLibDir);
 
         if (file !== undefined) {
             return file;
@@ -1553,17 +1636,17 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async setFileHandleRange(firstFileHandle: number, numFileHandles: number): Promise<void> {
-        this.log.pn(`Set file handle range: first handle = 0x${utils.hex2(firstFileHandle)}, num handles = ${numFileHandles}`);
+        this.log?.pn(`Set file handle range: first handle = 0x${utils.hex2(firstFileHandle)}, num handles = ${numFileHandles}`);
 
         if (firstFileHandle <= 0 || numFileHandles < 1 || firstFileHandle + numFileHandles > 256) {
-            this.log.pn(`Ignoring invalid settings.`);
+            this.log?.pn(`Ignoring invalid settings.`);
         } else {
             if (firstFileHandle !== this.firstFileHandle || numFileHandles !== this.openFiles.length) {
-                this.log.pn(`Settings have changed - closing any open files.`);
+                this.log?.pn(`Settings have changed - closing any open files.`);
                 try {
                     await this.closeAllFiles();
                 } catch (error) {
-                    this.log.pn(`Ignoring closeAllFiles error: ${error}`);
+                    this.log?.pn(`Ignoring closeAllFiles error: ${error}`);
                 }
 
                 this.firstFileHandle = firstFileHandle;
@@ -1574,6 +1657,14 @@ export class FS {
                 }
             }
         }
+    }
+
+    /////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////////////////////////////////////////////
+
+    private setState(state: IFSState): void {
+        this.state = state;
+        this.stateCommands = undefined;
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -2092,7 +2183,7 @@ export class FS {
 
         let i = 0;
         let volume: Volume;
-        let wasExplicitVolume: boolean;
+        let state: IFSState | undefined;
 
         if (str[i] === ':' && str[i + 1] === ':' && str.length > 3) {
             // ::x:whatever
@@ -2126,19 +2217,18 @@ export class FS {
             }
 
             volume = volumes[0];
-            wasExplicitVolume = true;
 
             i = end;
         } else {
             // This might produce a 'No volume' error, which feels a bit ugly at
             // the parsing step, but I don't think it matters in practice...
-            volume = this.getState().volume;
-            wasExplicitVolume = false;
+            state = this.getState();
+            volume = state.volume;
         }
 
         const fsp = volume.type.parseFileOrDirString(str, i, parseAsDir);
 
-        return new FSP(volume, wasExplicitVolume, fsp);
+        return new FSP(volume, state, fsp);
     }
 
     /////////////////////////////////////////////////////////////////////////
