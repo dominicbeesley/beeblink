@@ -87,7 +87,7 @@ all : programs roms
 programs: _uputest_program
 
 .PHONY : roms
-roms : _avr_rom _tube_serial_rom _upurs_rom _tube_serial_electron_rom _b2_rom
+roms : _avr_rom _tube_serial_rom _upurs_rom _tube_serial_electron_rom _b2_rom _myelin_serial_rom
 	@echo ---
 	$(_V)cd "$(DEST)" && $(PYTHON) ../../tools/sha1sum.py --size -x "$(VER)" -x "$(BUILD_INFO)" -x "$(COMMIT)" beeblink_tube_serial.rom beeblink_tube_serial_safe.rom beeblink_avr_fe60.rom beeblink_upurs_fe60.rom beeblink_tube_serial_electron.rom beeblink_tube_serial_safe_electron.rom beeblink_b2.rom
 
@@ -138,6 +138,10 @@ _upurs_rom : _dest $(DEST)/beeblink_constants.s65
 _tube_serial_electron_rom: _dest $(DEST)/beeblink_constants.s65
 	$(_V)$(MAKE) _rom "BUILD_INFO=$(BUILD_INFO)" ROM_SUFFIX=tube_serial_electron ROM_BEEB_NAME=ETS LINK=tube_serial CMD_PREFIX=TS "EXTRA_ARGS=-Dtarget_electron=true"
 	$(_V)$(MAKE) _rom "BUILD_INFO=$(BUILD_INFO)" ROM_SUFFIX=tube_serial_safe_electron ROM_BEEB_NAME=ETSS LINK=tube_serial CMD_PREFIX=TS "EXTRA_ARGS=-Dtarget_electron=true -Dtube_serial_safe=true"
+
+.PHONY : myelin_serial_rom
+_myelin_serial_rom : _dest $(DEST)/beeblink_constants.s65
+	$(MAKE) _rom "BUILD_TIME=$(BUILD_TIME)" ROM_SUFFIX=myelin_serial ROM_BEEB_NAME=MY LINK=myelin_serial CMD_PREFIX=MY
 
 ##########################################################################
 ##########################################################################
