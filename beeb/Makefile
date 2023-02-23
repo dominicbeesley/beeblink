@@ -3,7 +3,7 @@ TASS?=..\tools\64tass.exe
 PYTHON?=py
 else
 TASS?=64tass
-PYTHON?=python
+PYTHON?=python2
 endif
 
 ##########################################################################
@@ -68,9 +68,9 @@ all : programs roms
 programs: _update_program _uputest_program
 
 .PHONY : roms
-roms : _avr_rom _tube_serial_rom _upurs_rom
+roms : _avr_rom _tube_serial_rom _upurs_rom _myelin_serial_rom
 	@echo ---
-	@$(PYTHON) ../tools/sha1sum.py -x '$(VER)' -x '$(BUILD_TIME)' -x '$(COMMIT)' .build/beeblink_tube_serial.rom .build/beeblink_avr_fe60.rom .build/beeblink_upurs_fe60.rom
+	@$(PYTHON) ../tools/sha1sum.py -x '$(VER)' -x '$(BUILD_TIME)' -x '$(COMMIT)' .build/beeblink_tube_serial.rom .build/beeblink_avr_fe60.rom .build/beeblink_upurs_fe60.rom .build/beeblink_myelin_serial.rom
 
 ##########################################################################
 ##########################################################################
@@ -112,6 +112,10 @@ _tube_serial_rom : _dest $(DEST)/beeblink_constants.s65
 .PHONY : upurs_rom
 _upurs_rom : _dest $(DEST)/beeblink_constants.s65
 	$(MAKE) _rom "BUILD_TIME=$(BUILD_TIME)" ROM_SUFFIX=upurs_fe60 ROM_BEEB_NAME=UPUFE60 LINK=upurs CMD_PREFIX=U "EXTRA_ARGS=-Dlink_upurs_via=65120"
+
+.PHONY : myelin_serial_rom
+_myelin_serial_rom : _dest $(DEST)/beeblink_constants.s65
+	$(MAKE) _rom "BUILD_TIME=$(BUILD_TIME)" ROM_SUFFIX=myelin_serial ROM_BEEB_NAME=MY LINK=myelin_serial CMD_PREFIX=MY
 
 ##########################################################################
 ##########################################################################
