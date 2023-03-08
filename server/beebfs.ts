@@ -29,10 +29,8 @@ import * as utils from './utils';
 import * as gitattributes from './gitattributes';
 import * as errors from './errors';
 import CommandLine from './CommandLine';
-import dfsType from './dfsType';
-import pcType from './pcType';
-import tubeHostType from './tubeHostType';
 import * as server from './server';
+import * as inf from './inf';
 
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
@@ -56,6 +54,48 @@ const IGNORE_DIR_FILE_NAME = '.beeblink-ignore';
 const VOLUME_FILE_NAME = '.volume';
 
 const HOST_NAME_ESCAPE_CHAR = '#';
+
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
+// Slightly ugly, but the various FS types depend on this file for base classes.
+// TS doesn't support circular dependencies, so this file can't depend on them.
+//
+// Random tidier-looking idea from google:
+// https://medium.com/visual-development/how-to-fix-nasty-circular-dependency-issues-once-and-for-all-in-javascript-typescript-a04c987cf0de
+//
+// But maybe there's some tidier data-driven mechanism hiding here.
+
+interface IFSTypeRef {
+    type: IFSType | undefined;
+    name: string;
+}
+
+const gDFSType: IFSTypeRef = { type: undefined, name: 'DFSType' };
+const gPCType: IFSTypeRef = { type: undefined, name: 'PCType' };
+const gTubeHostType: IFSTypeRef = { type: undefined, name: 'TubeHostType' };
+
+function getFSType(typeRef: IFSTypeRef): IFSType {
+    if (typeRef.type === undefined) {
+        throw new Error(`${typeRef.name} not set`);
+    }
+
+    return typeRef.type;
+}
+
+function setFSType(typeRef: IFSTypeRef, type: IFSType): void {
+    if (typeRef.type !== undefined) {
+        throw new Error(`${typeRef.name} already set`);
+    }
+
+    typeRef.type = type;
+}
+
+export function setFSTypes(dfsType: IFSType, pcType: IFSType, tubeHostType: IFSType): void {
+    setFSType(gDFSType, dfsType);
+    setFSType(gPCType, pcType);
+    setFSType(gTubeHostType, tubeHostType);
+}
 
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
@@ -137,25 +177,27 @@ export function getHostChars(str: string): string {
 // are as supplied on command line, or filled in from defaults, as appropriate.
 //
 // This was a slightly late addition and isn't used everywhere it should be...
-export class FQN {
-    // Volume this FQN refers to.
+export abstract class FQN {
+    // Volume this FQN refers to. If this.volumeExplicit, the volume was
+    // explicitly set (e.g., by being provided as part of the name on the
+    // command line); otherwise, it was filled in from the current state.
     public readonly volume: Volume;
+    public readonly volumeExplicit: boolean;
 
-    // FS-specific name portion of this FQN.
-    public fsFQN: IFSFQN;
-
-    public constructor(volume: Volume, fsFQN: IFSFQN) {
+    public constructor(volume: Volume, volumeExplicit: boolean) {
         this.volume = volume;
-        this.fsFQN = fsFQN;
+        this.volumeExplicit = volumeExplicit;
     }
 
     public toString() {
-        return `::${this.volume.name}${this.fsFQN}`;
+        return `::${this.volume.name}`;//${this.fsFQN}`;
     }
 
     public equals(other: FQN): boolean {
-        return this.volume.equals(other.volume) && this.fsFQN.equals(other.fsFQN);
+        return this.volume.equals(other.volume);// && this.fsFQN.equals(other.fsFQN);
     }
+
+    public abstract isWildcard(): boolean;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -165,7 +207,7 @@ export class File {
     // Path of this file on the PC filing system.
     public readonly hostPath: string;
 
-    // Actual BBC file name.
+    // Actual BBC file name. 
     public readonly fqn: FQN;
 
     // BBC-style attributes.
@@ -266,40 +308,6 @@ export class Volume {
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
-// Name of Beeb file or dir, that may or may not exist, as entered on the
-// command line. Components not supplied are set to undefined.
-//
-// A BeebFSP always includes a volume. wasExplicitVolume indicates whether the
-// ::VOLUME syntax was used.
-export class FSP {
-    // Volume this FSP refers to.
-    public readonly volume: Volume;
-
-    // If the volume refers to one that's currently set, state is the state
-    // associated with it; if undefined, the ::VOLUME syntax was used.
-    public readonly state: IFSState | undefined;
-
-    // FS-specific portion of the FSP.
-    public readonly fsFSP: IFSFSP;
-
-    public constructor(volume: Volume, state: IFSState | undefined, name: IFSFSP) {
-        this.volume = volume;
-        this.state = state;
-        this.fsFSP = name;
-    }
-
-    public toString(): string {
-        return `::${this.volume.name}${this.fsFSP}`;
-    }
-
-    public wasExplicitVolume(): boolean {
-        return this.state === undefined;
-    }
-}
-
-/////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////
-
 export class OSGBPBResult {
     public readonly c: boolean;
     public readonly numBytesLeft: number | undefined;
@@ -394,7 +402,7 @@ export interface IFSState {
 
     // get file to use for *RUN. If tryLibDir is false, definitely don't try lib
     // drive/directory.
-    getFileForRUN(fsp: FSP, tryLibDir: boolean): Promise<File | undefined>;
+    getFileForRUN(fqn: FQN, tryLibDir: boolean): Promise<File | undefined>;
 
     // get *CAT text, given command line. Handle default case, when
     // commandLine===undefined, and any straightforward special cases that would
@@ -410,10 +418,10 @@ export interface IFSState {
     starDrive(arg: string | undefined): void;
 
     // handle *DIR.
-    starDir(fsp: FSP | undefined): void;
+    starDir(fqn: FQN | undefined): void;
 
     // handle *LIB.
-    starLib(fsp: FSP | undefined): void;
+    starLib(fqn: FQN | undefined): void;
 
     // handle *HSTATUS drives output.
     getDrivesOutput(): Promise<string>;
@@ -454,28 +462,31 @@ export interface IFSType {
     // whether this FS supports writing.
     canWrite(): boolean;
 
-    // check if given string is a valid BBC file name. Used to check that a .INF
-    // file is valid, or whether a .INF/0-byte .INF PC file has a valid BBC
-    // name.
-    isValidBeebFileName(str: string): boolean;
+    // get list of all Beeb files in volume.
+    //
+    // If volumeOrFQN is a Volume, find all files in the volume; if volumeOrFQN
+    // is a FQN, find all files matching that FQN.
+    //
+    // When called with a FQN, this entry point differs from
+    // findBeebFilesMatching in that it may discover files that aren't directly
+    // accessible via a Beeb path, but could become so by arrangement.
+    findBeebFilesInVolume(volumeOrFQN: Volume | FQN, log: utils.Log | undefined): Promise<File[]>;
 
-    // get list of Beeb files matching the given FSP/FQN in the given volume. If
-    // an FQN, do a wildcard match; if an FSP, same, treating any undefined
-    // values as matching anything; if undefined, find absolutely everything.
-    findBeebFilesMatching(volume: Volume, pattern: IFSFSP | IFSFQN | undefined, recurse: boolean, log: utils.Log | undefined): Promise<File[]>;
+    // get list of Beeb files matching FQN. The volume will be of the right type.
+    findBeebFilesMatching(fqn: FQN, recurse: boolean, log: utils.Log | undefined): Promise<File[]>;
 
     // parse file/dir string, starting at index i. 
-    parseFileOrDirString(str: string, i: number, parseAsDir: boolean): IFSFSP;
+    parseFileOrDirString(str: string, i: number, state: IFSState | undefined, parseAsDir: boolean, volume: Volume, volumeExplicit: boolean): FQN;
 
     // create appropriate FSFQN from FSFSP, filling in defaults from the given State as appropriate.
-    createFQN(fsp: IFSFSP, state: IFSState | undefined): IFSFQN;
+    //createFQN(fsp: IFSFSP, state: IFSState | undefined): IFSFQN;
 
     // get ideal host path for FQN, relative to whichever volume it's in. Used
     // when creating a new file.
-    getHostPath(fqn: IFSFQN): string;
+    getIdealVolumeRelativeHostPath(fqn: FQN): string;
 
-    // get *CAT text for FSP.
-    getCAT(fsp: FSP, state: IFSState | undefined, log: utils.Log | undefined): Promise<string>;
+    // get *CAT text.
+    getCAT(fqn: FQN, state: IFSState | undefined, log: utils.Log | undefined): Promise<string>;
 
     // delete the given file.
     deleteFile(file: File): Promise<void>;
@@ -485,7 +496,7 @@ export interface IFSType {
     renameFile(file: File, newName: FQN): Promise<void>;
 
     // write the metadata for the given file.
-    writeBeebMetadata(hostPath: string, fqn: IFSFQN, load: number, exec: number, attr: number): Promise<void>;
+    writeBeebMetadata(hostPath: string, fqn: FQN, load: number, exec: number, attr: number): Promise<void>;
 
     // get new attributes from attribute string. Return undefined if invalid.
     getNewAttributes(oldAttr: number, attrString: string): number | undefined;
@@ -508,28 +519,6 @@ export interface IFSType {
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
-// Name as supplied by caller. Properties may be undefined if they weren't
-// provided.
-//
-// explicitly mentioning toString avoids the no-empty-interface tslint warning
-// (that I haven't decided what to do about yet).
-export interface IFSFSP {
-    toString(): string;
-}
-
-/////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////
-
-export interface IFSFQN {
-    readonly name: string;
-    equals(other: IFSFQN): boolean;
-    toString(): string;
-    isWildcard(): boolean;
-}
-
-/////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////
-
 // get single BeebFile matching the given fqn.
 //
 // If wildcardsOK, wildcards are acceptable, but the pattern must match exactly
@@ -541,12 +530,12 @@ export async function getBeebFile(fqn: FQN, wildcardsOK: boolean, throwIfNotFoun
     log?.pn(`getBeebFile: ${fqn}; wildCardsOK=${wildcardsOK} throwIfNotFound=${throwIfNotFound}`);
 
     if (!wildcardsOK) {
-        if (fqn.fsFQN.isWildcard()) {
+        if (fqn.isWildcard()) {
             return errors.badName();
         }
     }
 
-    const files = await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, false, log);
+    const files = await fqn.volume.type.findBeebFilesMatching(fqn, false, log);
     log?.pn(`found ${files.length} file(s)`);
 
     if (files.length === 0) {
@@ -701,7 +690,7 @@ export class FS {
             return false;
         }
 
-        async function findBeebLinkVolumesMatchingRecursive(folderPath: string, indent: string): Promise<boolean> {
+        const findBeebLinkVolumesMatchingRecursive = async (folderPath: string, indent: string): Promise<boolean> => {
             log?.pn(indent + 'Looking in: ' + folderPath + '...');
 
             let names: string[];
@@ -746,7 +735,7 @@ export class FS {
                                 volumeName = name;
                             }
 
-                            if (addVolume(volumePath, volumeName, dfsType)) {
+                            if (addVolume(volumePath, volumeName, getFSType(gDFSType))) {
                                 return true;
                             }
                         }
@@ -761,7 +750,7 @@ export class FS {
             }
 
             return false;
-        }
+        };
 
         for (const folder of searchFolders.beebLinkSearchFolders) {
             if (await findBeebLinkVolumesMatchingRecursive(folder, '')) {
@@ -780,11 +769,11 @@ export class FS {
             return false;
         }
 
-        if (addFolders(searchFolders.pcFolders, pcType)) {
+        if (addFolders(searchFolders.pcFolders, getFSType(gPCType))) {
             return volumes;
         }
 
-        if (addFolders(searchFolders.tubeHostFolders, tubeHostType)) {
+        if (addFolders(searchFolders.tubeHostFolders, getFSType(gTubeHostType))) {
             return volumes;
         }
 
@@ -840,7 +829,11 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public constructor(searchFolders: IFSSearchFolders, gaManipulator: gitattributes.Manipulator | undefined, log: utils.Log | undefined, locateVerbose: boolean) {
+    public constructor(
+        searchFolders: IFSSearchFolders,
+        gaManipulator: gitattributes.Manipulator | undefined,
+        log: utils.Log | undefined,
+        locateVerbose: boolean) {
         this.log = log;
 
         this.searchFolders = searchFolders;
@@ -875,14 +868,14 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public async parseDirString(dirString: string): Promise<FSP> {
+    public async parseDirString(dirString: string): Promise<FQN> {
         return await this.parseFileOrDirString(dirString, true);
     }
 
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public async parseFileString(fileString: string): Promise<FSP> {
+    public async parseFileString(fileString: string): Promise<FQN> {
         return await this.parseFileOrDirString(fileString, false);
     }
 
@@ -971,34 +964,34 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     public async starDir(arg: string | undefined): Promise<void> {
-        let fsp: FSP | undefined;
+        let fqn: FQN | undefined;
 
         if (arg !== undefined) {
-            fsp = await this.parseDirString(arg);
+            fqn = await this.parseDirString(arg);
 
-            if (fsp.wasExplicitVolume()) {
-                await this.mount(fsp.volume);
+            if (fqn.volumeExplicit) {
+                await this.mount(fqn.volume);
             }
         }
 
-        this.getState().starDir(fsp);
+        this.getState().starDir(fqn);
     }
 
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
     public async starLib(arg: string | undefined): Promise<void> {
-        let fsp: FSP | undefined;
+        let fqn: FQN | undefined;
 
         if (arg !== undefined) {
-            fsp = await this.parseDirString(arg);
+            fqn = await this.parseDirString(arg);
 
-            if (fsp.wasExplicitVolume()) {
+            if (fqn.volumeExplicit) {
                 return errors.badDir();
             }
         }
 
-        this.getState().starLib(fsp);
+        this.getState().starLib(fqn);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1060,30 +1053,15 @@ export class FS {
             errors.nodeError(error);
         }
 
-        const newVolume = new Volume(volumePath, name, dfsType);
+        const newVolume = new Volume(volumePath, name, getFSType(gDFSType));
         return newVolume;
     }
 
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public async parseFQN(fileString: string): Promise<FQN> {
-        this.log?.pn('parseFQN: ``' + fileString + '\'\'');
-
-        const fsp = await this.parseFileString(fileString);
-        this.log?.pn('    fsp: ' + fsp);
-
-        const fqn = new FQN(fsp.volume, fsp.volume.type.createFQN(fsp.fsFSP, this.state));
-        this.log?.pn(`    fqn: ${fqn}`);
-
-        return fqn;
-    }
-
-    /////////////////////////////////////////////////////////////////////////
-    /////////////////////////////////////////////////////////////////////////
-
     public async findFilesMatching(fqn: FQN): Promise<File[]> {
-        return await fqn.volume.type.findBeebFilesMatching(fqn.volume, fqn.fsFQN, false, this.log);
+        return await fqn.volume.type.findBeebFilesMatching(fqn, false, this.log);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1136,19 +1114,19 @@ export class FS {
 
             try {
                 if (this.locateVerbose) {
-                    this.log?.in('  ');
+                    this.log?.inN(2);
                 }
 
-                let fsp: IFSFSP;
+                let fqn: FQN;
                 try {
-                    fsp = volume.type.parseFileOrDirString(arg, 0, false);
+                    fqn = volume.type.parseFileOrDirString(arg, 0, undefined, false, volume, true);
                 } catch (error) {
                     // if the arg wasn't even parseable by this volume's type, it
                     // presumably won't match any file...
                     continue;
                 }
 
-                const files = await volume.type.findBeebFilesMatching(volume, fsp, true, this.locateVerbose ? this.log : undefined);
+                const files = await volume.type.findBeebFilesInVolume(fqn, this.locateVerbose ? this.log : undefined);
 
                 for (const file of files) {
                     foundFiles.push(file);
@@ -1237,9 +1215,14 @@ export class FS {
             return errors.generic('*CAT internal error');
         }
 
-        const fsp = await this.parseDirString(commandLine);
+        const fqn = await this.parseDirString(commandLine);
 
-        return await fsp.volume.type.getCAT(fsp, this.getState(), this.log);
+        let state: IFSState | undefined = this.getState();
+        if (fqn.volumeExplicit) {
+            state = undefined;
+        }
+
+        return await fqn.volume.type.getCAT(fqn, state, this.log);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1316,7 +1299,7 @@ export class FS {
             return errors.badName();
         }
 
-        const fqn = await this.parseFQN(commandLine.parts[0]);
+        const fqn = await this.parseFileString(commandLine.parts[0]);
 
         if (a === 0) {
             return await this.OSFILESave(fqn, block.readUInt32LE(0), block.readUInt32LE(4), data);
@@ -1360,7 +1343,7 @@ export class FS {
         const write = (mode & 0x80) !== 0;
         const read = (mode & 0x40) !== 0;
 
-        const fqn = await this.parseFQN(commandLine.parts[0]);
+        const fqn = await this.parseFileString(commandLine.parts[0]);
         let hostPath: string;
 
         let contentsBuffer: Buffer | undefined;
@@ -1422,10 +1405,10 @@ export class FS {
             }
 
             hostPath = this.getHostPath(fqn);
-            await utils.mustNotExist(hostPath);
+            await inf.mustNotExist(hostPath);
 
             // Create file.
-            await this.OSFILECreate(fqn, 0, 0, 0);
+            await this.OSFILECreate(fqn, SHOULDNT_LOAD, SHOULDNT_EXEC, 0);
         }
 
         const contents: number[] = [];
@@ -1609,7 +1592,7 @@ export class FS {
         if (this.gaManipulator !== undefined) {
             if (!newFQN.volume.isReadOnly()) {
                 // could be cleverer than this.
-                this.gaManipulator.renameFile(oldFile.hostPath, newFQN.volume.type.getHostPath(newFQN.fsFQN));
+                this.gaManipulator.renameFile(oldFile.hostPath, newFQN.volume.type.getIdealVolumeRelativeHostPath(newFQN));
             }
         }
     }
@@ -1617,13 +1600,13 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    public async getFileForRUN(fsp: FSP, tryLibDir: boolean): Promise<File> {
-        if (fsp.wasExplicitVolume()) {
+    public async getFileForRUN(fqn: FQN, tryLibDir: boolean): Promise<File> {
+        if (fqn.volumeExplicit) {
             // Definitely don't try lib drive/dir if volume was specified.
             tryLibDir = false;
         }
 
-        const file = await this.getState().getFileForRUN(fsp, tryLibDir);
+        const file = await this.getState().getFileForRUN(fqn, tryLibDir);
 
         if (file !== undefined) {
             return file;
@@ -1671,7 +1654,7 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     private getHostPath(fqn: FQN): string {
-        return path.join(fqn.volume.path, fqn.volume.type.getHostPath(fqn.fsFQN));
+        return path.join(fqn.volume.path, fqn.volume.type.getIdealVolumeRelativeHostPath(fqn));
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1732,7 +1715,7 @@ export class FS {
         } else {
             hostPath = this.getHostPath(fqn);
 
-            await utils.mustNotExist(hostPath);
+            await inf.mustNotExist(hostPath);
         }
 
         const attr = DEFAULT_ATTR;
@@ -1760,7 +1743,7 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
 
     private async writeBeebMetadata(hostPath: string, fqn: FQN, load: number, exec: number, attr: number): Promise<void> {
-        await fqn.volume.type.writeBeebMetadata(hostPath, fqn.fsFQN, load, exec, attr);
+        await fqn.volume.type.writeBeebMetadata(hostPath, fqn, load, exec, attr);
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -2176,13 +2159,14 @@ export class FS {
     /////////////////////////////////////////////////////////////////////////
     /////////////////////////////////////////////////////////////////////////
 
-    private async parseFileOrDirString(str: string, parseAsDir: boolean): Promise<FSP> {
+    private async parseFileOrDirString(str: string, parseAsDir: boolean): Promise<FQN> {
         if (str === '') {
             return errors.badName();
         }
 
         let i = 0;
         let volume: Volume;
+        let volumeExplicit: boolean;
         let state: IFSState | undefined;
 
         if (str[i] === ':' && str[i + 1] === ':' && str.length > 3) {
@@ -2217,6 +2201,7 @@ export class FS {
             }
 
             volume = volumes[0];
+            volumeExplicit = true;
 
             i = end;
         } else {
@@ -2224,11 +2209,11 @@ export class FS {
             // the parsing step, but I don't think it matters in practice...
             state = this.getState();
             volume = state.volume;
+            volumeExplicit = false;
         }
 
-        const fsp = volume.type.parseFileOrDirString(str, i, parseAsDir);
-
-        return new FSP(volume, state, fsp);
+        const fqn = volume.type.parseFileOrDirString(str, i, state, parseAsDir, volume, volumeExplicit);
+        return fqn;
     }
 
     /////////////////////////////////////////////////////////////////////////

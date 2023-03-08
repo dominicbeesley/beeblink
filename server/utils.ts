@@ -29,7 +29,6 @@ import * as path from 'path';
 import { Chalk } from 'chalk';
 import * as beeblink from './beeblink';
 import * as errors from './errors';
-import * as inf from './inf';
 
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
@@ -49,7 +48,6 @@ export const fsClose = util.promisify(fs.close);
 export const fsRead = util.promisify(fs.read);
 export const fsRename = util.promisify(fs.rename);
 export const fsMkdir = util.promisify(fs.mkdir);
-export const fsExists = util.promisify(fs.exists);
 export const fsWriteFile = util.promisify(fs.writeFile);
 
 /////////////////////////////////////////////////////////////////////////
@@ -305,6 +303,10 @@ export class Log {
     public in(x: string) {
         this.p(x);
         this.pushAbsoluteIndent(this.column);
+    }
+
+    public inN(n: number): void {
+        this.pushAbsoluteIndent(this.column + n);
     }
 
     public out() {
@@ -636,6 +638,16 @@ export function strieq(a: string, b: string): boolean {
     return a.toLowerCase() === b.toLowerCase();
 }
 
+export function struieq(a: string | undefined, b: string | undefined): boolean {
+    if (a === undefined && b === undefined) {
+        return true;
+    } else if (a !== undefined && b !== undefined) {
+        return strieq(a, b);
+    } else {
+        return false;
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////
 
@@ -672,6 +684,22 @@ export async function tryStat(filePath: string): Promise<fs.Stats | undefined> {
     } catch (error) {
         return undefined;
     }
+}
+
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+
+export async function isFile(filePath: string): Promise<boolean> {
+    const stat = await tryStat(filePath);
+    if (stat === undefined) {
+        return false;
+    }
+
+    if (!stat.isFile()) {
+        return false;
+    }
+
+    return true;
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -777,6 +805,7 @@ export function isBASIC(b: Buffer): boolean {
 
 export const MATCH_N_CHAR = '*';
 export const MATCH_ONE_CHAR = '#';
+const MATCH_ANY_REG_EXP = new RegExp('^.*$');
 
 export function isAmbiguousAFSP(afsp: string): boolean {
     if (afsp.includes(MATCH_N_CHAR)) {
@@ -794,23 +823,38 @@ export function isAmbiguousAFSP(afsp: string): boolean {
 // how DFS does it, in that a * will match chars in the middle of a string,
 // not just at the end.
 export function getRegExpFromAFSP(afsp: string): RegExp {
-    let r = '^';
+    if (afsp === '*') {
+        return MATCH_ANY_REG_EXP;
+    } else {
+        let r = '^';
 
-    for (const c of afsp) {
-        if (c === MATCH_N_CHAR) {
-            r += '.*';
-        } else if (c === MATCH_ONE_CHAR) {
-            r += '.';
-        } else if (isalnum(c)) {
-            r += c;
-        } else {
-            r += '\\' + c;
+        for (const c of afsp) {
+            if (c === MATCH_N_CHAR) {
+                r += '.*';
+            } else if (c === MATCH_ONE_CHAR) {
+                r += '.';
+            } else if (isalnum(c)) {
+                r += c;
+            } else {
+                r += '\\' + c;
+            }
         }
+
+        r += '$';
+
+        return new RegExp(r, 'i');
     }
+}
 
-    r += '$';
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
 
-    return new RegExp(r, 'i');
+export function matchesOptionalRegExp(str: string, re: RegExp | undefined): boolean {
+    if (re === undefined) {
+        return true;
+    } else {
+        return re.exec(str) !== null;
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////
@@ -916,22 +960,6 @@ export function getFirstLine(b: Buffer): string {
     }
 
     return b.toString('binary', 0, i).trim();
-}
-
-/////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////
-
-// Causes a 'Exists on server' error if the given host file or metadata
-// counterpart exists.
-//
-// This is to cater for trying to create a new file that would have the same
-// PC name as an existing file. Could be due to mismatches between BBC names
-// in the .inf files and the actual names on disk, could be due to loose
-// non-BBC files on disk...
-export async function mustNotExist(hostPath: string): Promise<void> {
-    if (await fsExists(hostPath) || await fsExists(hostPath + inf.ext)) {
-        return errors.exists('Exists on server');
-    }
 }
 
 /////////////////////////////////////////////////////////////////////////
