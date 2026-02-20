@@ -18,44 +18,194 @@
 ; along with this program. If not, see
 ; <https://www.gnu.org/licenses/>.
 ;
-
-
-                .section code
+;-------------------------------------------------------------------------
+; random notes
+;-------------------------------------------------------------------------
+; Macros with names ending in '_routine' generate entire routines,
+; that finish with an rts.
+;-------------------------------------------------------------------------
+; Routines with an itu_ prefix only run on a Master when internal Tube
+; is active. 65c02 code is OK.
+;-------------------------------------------------------------------------
+; The Master host code just gets straight to poking the Tube I/O as
+; part of its EVENTV handler:
+; 
+; Send event across Tube
+; ----------------------
+; 0682 48          H    PHA
+; 0683 A9 00       ).   LDA #&00
+; 0685 20 91 06     ..  JSR &0691
+; 0688 98          .    TYA
+; 0689 20 91 06     ..  JSR &0691
+; 068C 8A          .    TXA
+; 068D 20 91 06     ..  JSR &0691
+; 0690 68          h    PLA
+; 
+; Send byte in A via R1
+; ---------------------
+; 0691 2C E0 FE    ,`~  BIT &FEE0
+; 0694 50 FB       P{   BVC &0691
+; 0696 8D E1 FE    .a~  STA &FEE1
+; 0699 60          `    RTS
+; 
+; So if the ITU bit had to be disabled to gain access to the FTDI
+; board, the transfer has to be performed with interrupts disabled. To
+; avoid keeping IRQs disabled for too long, the transfer routine will
+; enable IRQs while waiting if it has to wait for the appropriate FIFO
+; status, but in the best case it will do the entire transfer with
+; IRQs disabled.
+; 
+; (The intention is that IRQs are disabled for no more than ~4ms at a
+; time - this is not ideal, but should at least mean that TIME doesn't
+; go too wrong.)
+;
+; If there's an NMI during a transfer.. bang, probably? I don't think
+; this is fixable. Not an issue with disc though.
+;-------------------------------------------------------------------------
+; There are 16 transfer cases: all combinations of (send, recv) and
+; (host, parasite), (ITU, non-ITU), (bytes, page).
+;
+; 12 of these cases are regular enough that it's worth generating by
+; macro, and the remaining 4 (parasite + ITU) are hand-written.
+;
+; There is also a macro for generating the driver code that calls a
+; bytes routine 0/1 time, a page routine 0-N time, updates the
+; src/dest address and looks after claiming the Tube and setting up
+; transfer modes.
+; -------------------------------------------------------------------------
 
                 .cerror NUM_SERIAL_SYNC_ZEROS<0||NUM_SERIAL_SYNC_ZEROS>65535,'NUM_SERIAL_SYNC_ZEROS must be a 16-bit uint'
 
                 ; makes a bit of a difference in FSTEST. 1.3x as many
                 ; BGETs per second.
 send_1_byte_messages=true
+
+                ; write R (received)/S (sent) debug markers while
+                ; running.
+debug_markers=false
+
+                ; Seen on macOS Big Sur with continuous BGETs:
+                ; occasional hangs, due to bytes going missing. Looks
+                ; like they make it to the Mac's USB layer, but then
+                ; never show up for fd readability purposes as
+                ; reported by kqueue. But then send 1 more byte from
+                ; the Beeb, and the missing bytes turn up! - plus the
+                ; one you just sent.
+                ;
+                ; If true, apply a workaround for this: if no response
+                ; is forthcoming after a reasonable time passes, send
+                ; a byte that the server will ignore, and see if that
+                ; helps.
+use_placeholder_requests=true
+                
+                .if use_placeholder_requests
+                ; The reasonable time mentioned above, in number of
+                ; FIFO poll calls. Corresponds to ~0.5 sec (no
+                ; Tube/ext Tube) or ~1.0 sec (int Tube).
+reasonable_wait_time=16384
+                .endif
+
+;-------------------------------------------------------------------------
+;
+; Safe builds route all Tube Serial writes through a single routine
+; that runs from a specific address.
+;
+; A work around for the issue discussed in
+; https://stardot.org.uk/forums/viewtopic.php?f=3&t=27093
+
+                .weak
+tube_serial_safe=false
+                .endweak
+
+sta_fifo: .macro
+                .if tube_serial_safe
+                jsr sta_fifo_helper
+                .else
+                sta fifo
+                .endif
+                .endmacro
+
+stx_fifo: .macro
+                .if tube_serial_safe
+                jsr stx_fifo_helper
+                .else
+                stx fifo
+                .endif
+                .endmacro
+
+sty_fifo: .macro
+                .if tube_serial_safe
+                jsr sty_fifo_helper
+                .else
+                sty fifo
+                .endif
+                .endmacro
                 
 ;-------------------------------------------------------------------------
-                
-                .virtual $fca0
-fifo:
-                .endv
 
-                .virtual $fca1
+                .virtual $FCA0
+fifo:
+                .endvirtual
+
+                .virtual $FCA1
 status: .block
 rx_data=$01
 tx_space=$02
-                .bend
-                .endv
+                .endblock
+                .endvirtual
 
 ;-------------------------------------------------------------------------
 
-myelin_serial: .block
+tube_serial: .block
 
+syncdp: .macro items
+                ;.debug_print \items 
+                .endmacro
+                
 txdp: .macro items
-                ; .debug_print \items 
-                .endm
+                ;.debug_print \items 
+                .endmacro
+
+;-------------------------------------------------------------------------
+;
+; Transfer mode stuff.
+;
+
+; Supply these to the dir argument of any of the transfer-related
+; macros.
+send=1                      ;parasite->host when doing a Tube transfer
+recv=2                      ;host->parasite when doing a Tube transfer
+
+; Crude dir validity check.
+check_dir: .macro dir
+                .cerror \dir!=send&&\dir!=recv,'bad send/recv dir'
+                .endmacro
+
+; Get appropriate status register flag for dir.
+get_status_flag_for_dir: .function dir
+                .check_dir dir
+                .endf dir==send?status.tx_space:status.rx_data
+
+; Tube transfer reason code for transfer mode and direction.
+tube_multi_byte=tube_multi_byte_parasite_to_host
+tube_256_byte=tube_256_byte_parasite_to_host
+                
+get_tube_mode: .function mode,dir
+                .check_dir \dir
+                .cerror \mode!=tube_multi_byte&&\mode!=tube_256_byte,'bad Tube transfer mode'
+                .endf mode|(\dir==send?0:1)
+                
                 
 ;-------------------------------------------------------------------------
 
                 .section link_startup_workspace
 num_sync_zeros_received: .fill 2
+                .if !target_electron
+startup_itu: .fill 1
+                .endif
 startup_counter: .fill 2
 startup_sync_counter: .fill 1
-                .send link_startup_workspace
+                .endsection link_startup_workspace
 
 ; ; The link startup workspace is a not-very-generous 8 bytes.
 ; startup_end_time=brkthunk+0
@@ -65,10 +215,87 @@ startup_sync_counter: .fill 1
 ;-------------------------------------------------------------------------
 
                 .section link_workspace
-link_old_y: .fill 1
 link_value: .fill 1
-                .send link_workspace
+link_transfer_flags: .fill 1
+link_transfer_thunk: .fill 3    ;$4C, LSB, MSB
+link_itu:
+; bit 7 set if M128, using internal Tube.
+;
+; Still defined on Electron, so it can be set to a safe value as a
+; workaround for https://github.com/tom-seddon/beeblink/issues/202 -
+; looks like Electron ADFS might also have an unknown IRQ handler that
+; tests the same flags.
+                .fill 1
+link_old_y: .fill 1
+link_last_status_byte: .fill 1
+                .endsection link_workspace
+
+                .cerror link_itu!=$cd ;https://github.com/tom-seddon/beeblink/issues/202
                 
+;-------------------------------------------------------------------------
+; Check if ACCCON ITU needs resetting to access the FTDI device.
+;
+; In principle there's a race condition here, and ITU could become
+; set. But it looks like the MOS actually just leaves it alone after
+; initialisation, so it's all quite safe(tm)...
+;
+; exit: A=$00 if no handling required (B/B+/M128 with ext Tube or no Tube)
+;       A=$80 if handling required (M128 with int Tube)
+; preserves: X; Y
+
+is_itu: .proc
+                txa
+                pha
+                
+                ; http://beebwiki.mdfs.net/OSBYTE_&00
+                lda #0
+                ldx #1
+                jsr osbyte
+
+                ; X=0 (Electron), 1 (B), 2 (B+), 3 (Master), 4 (Master
+                ; ET), 5 (Master Compact) - all other options appears
+                ; to be non-6502.
+                cpx #3
+                bcs maybe_itu   ;maybe itu if Master/ET/Compact
+
+                cpx #0
+                beq xtu         ;always xtu if Electron
+
+                ; OS 1.20 or OS 2.00. This is probably a B or B+, but
+                ; it could also be a Master with a modified OS, in
+                ; which case ITU might still need resetting.
+                ;
+                ; (On the RetroClinic multi-MOS I've got, ITU is set
+                ; in ACCCON on startup, so the extra processing is
+                ; required.)
+                ; 
+                ; Easiest way to detect the Master hardware: simply
+                ; read ACCCON. If it's $fe (usual bus capacitance
+                ; thing), it's a B/B+; otherwise, it's a Master. Looks
+                ; like bits 7+6 are clear when reading on a Master, so
+                ; $fe is impossible.
+                lda $fe34
+                cmp #$fe
+                bne maybe_itu   ;looks like actually Master hardware
+
+xtu:
+                clc
+                bcc done
+                
+maybe_itu:
+                lda acccon
+                and #acccon.itu
+                cmp #acccon.itu ;C=1 if ITU
+                
+done:
+                pla
+                tax
+
+                lda #0
+                ror a
+                rts
+
+                .endproc
 
 ;-------------------------------------------------------------------------
 ; Reads status register during startup. Handles Tube palaver if
@@ -76,9 +303,32 @@ link_value: .fill 1
 ;
 ; exit: A=value of status register
 startup_read_status: .proc
+                .if !target_electron
+                bit startup_itu
+                bmi +
+                .endif
 
                 lda status
                 rts
+
+                .if !target_electron
++
+                .cpu '65c02'
+                php
+                sei
+
+                ldx acccon
+                lda #acccon.itu
+                trb acccon
+
+                lda status
+
+                stx acccon
+                plp
+                .cpu 'default'
+                rts
+                .endif
+                .endproc
 
 ;-------------------------------------------------------------------------
 ; Read FIFO during startup. Handles Tube palaver if required.
@@ -86,6 +336,10 @@ startup_read_status: .proc
 ; exit: C=0 if no data was available
 ;       C=1 if data was available, A = value read
 startup_read_fifo: .proc
+                .if !target_electron
+                bit startup_itu
+                bmi itu
+                .endif
 
 read_fifo:
                 lda status
@@ -101,6 +355,26 @@ got_data:
                 sec
                 rts
 
+                .if !target_electron
+itu:
+                .cpu '65c02'
+                php
+                sei
+
+                ldx acccon
+
+                lda #acccon.itu
+                trb acccon
+
+                jsr read_fifo
+
+                stx acccon
+                plp
+                .cpu 'default'
+                rts
+                .endif
+                .endproc
+
 ;-------------------------------------------------------------------------
 ; Write FIFO during startup. Handles Tube palaver if required.
 ;
@@ -108,6 +382,10 @@ got_data:
 ; exit: C=0 if no space
 ;       C=1 if data was written
 startup_write_fifo: .proc
+                .if !target_electron
+                bit startup_itu
+                bmi itu
+                .endif
 
 write_y_fifo:
                 lda status
@@ -119,14 +397,41 @@ no_space:
                 rts
 
 space:
-                sty fifo
+                .sty_fifo
                 sec
                 rts
 
+                .if !target_electron
+itu:
+                .cpu '65c02'
+                php
+                sei
+
+                lda #acccon.itu
+                trb acccon
+
+                jsr write_y_fifo
+
+                lda #acccon.itu
+                tsb acccon
+
+                ror a           ;save carry
+                
+                plp
+                .cpu 'default'
+
+                asl a           ;restore carry
+                rts
+                .endif
+                .endproc
                 
 ;-------------------------------------------------------------------------
 
 startup: .proc
+                .if !target_electron
+                jsr is_itu
+                sta startup_itu
+                .endif
 
 ; During service call 3, IRQs appear to be disabled. So the startup
 ; process doesn't check the system clock - it just counts number of
@@ -149,10 +454,10 @@ wait_for_device_ready_loop:
                 
                 jsr startup_read_status
                 
-                ; wait for bit 3 to become set.
-                and #status.configured
-                beq wait_for_device_ready_loop
-
+;;dom;;                ; wait for bit 3 to become set.
+;;dom;;                and #status.configured
+;;dom;;                beq wait_for_device_ready_loop
+;;dom;;
 start_sync:
                 dec startup_sync_counter
                 beq failed
@@ -162,7 +467,7 @@ start_sync:
                 sta num_sync_zeros_received+1
 
                 .block
-                .debug_print ['Sync step 0...\r\n']
+                .syncdp ['Sync step 0...\r\n']
                 lda #1
                 jsr reset_startup_counter
 sync_step_0_loop:
@@ -173,10 +478,10 @@ sync_step_0_loop:
                 jsr startup_write_fifo
 
                 bcc sync_step_0_loop
-                .bend
+                .endblock
 
                 .block
-                .debug_print ['Sync step 1...\r\n']
+                .syncdp ['Sync step 1...\r\n']
                 lda #255
                 jsr reset_startup_counter
 sync_step_1_loop:
@@ -210,12 +515,12 @@ sync_step_1_loop:
                 lda num_sync_zeros_received+1
                 cmp #>NUM_SERIAL_SYNC_ZEROS
                 bne sync_step_1_loop
-                .bend
+                .endblock
 
                 .block
                 ; Keep reading until the 1 byte is received. Continue
                 ; sending zeros meanwhile.
-                .debug_print ['Sync step 2...\r\n']
+                .syncdp ['Sync step 2...\r\n']
                 lda #16
                 jsr reset_startup_counter
 sync_step_2_loop:
@@ -234,12 +539,12 @@ sync_step_2_loop:
                 beq sync_step_2_loop
 
                 cmp #1
-                bne failed
-                .bend
+                bne failed_2
+                .endblock
 
                 .block
                 ; Send a single non-zero byte.
-                .debug_print ['Sync step 3...\r\n']
+                .syncdp ['Sync step 3...\r\n']
                 lda #16
                 jsr reset_startup_counter
 sync_step_3_loop:
@@ -249,14 +554,19 @@ sync_step_3_loop:
                 ldy #$01
                 jsr startup_write_fifo
                 bcc sync_step_3_loop
-                .bend
+                .endblock
 ok:
-                .debug_print ['Sync success (probably)\r\n']
+                .syncdp ['Sync success (probably)\r\n']
                 clc             ;good
                 rts
 
 failed:
                 ldx #status_text.sync_failed-status_text
+                sec             ;no good
+                rts
+
+failed_2:
+                ldx #status_text.sync_failed_2-status_text
                 sec             ;no good
                 rts
 
@@ -286,7 +596,7 @@ check_startup_counter:
 
                 
                 
-                .pend
+                .endproc
 
 status_text: .block
 not_ready:
@@ -299,28 +609,116 @@ sync_timed_out_1:
                 .text 'Sync timeout (step 1)',0
 sync_timed_out_2:
                 .text 'Sync timeout (step 2)',0
+sync_failed_2:
+                .text 'Sync failed (step 2)',0
 sync_timed_out_3:
                 .text 'Sync timeout (step 3)',0
-                .bend
+                .endblock
+
+;-------------------------------------------------------------------------
+;
+; Begin send (with restart).
+;
+; The restart process for Tube Serial involves setting up the ITU
+; flag.
+;
+begin_send_with_restart: .proc
+                pha             ;save packet type
+
+                .if target_electron
+
+                lda #0
+                sta link_itu
+
+                .else
+                
+                ; sort out ITU flag
+                jsr is_itu
+                and #$80 ; https://github.com/tom-seddon/beeblink/issues/202
+                sta link_itu
+
+                .endif
+
+                pla             ;restore packet type
+                
+                jmp begin_send_without_restart
+                .endproc
                 
 ;-------------------------------------------------------------------------
 ;
-; Begin send.
+; Begin send (no restart). Assumes link_itu was already set up.
 ; 
-begin_send: .proc
+begin_send_without_restart: .proc
                 pha             ;save packet type
 
+                cmp #FNF_REQUESTS_BEGIN
+                bcc _drain       ;not a F&F request. Drain FIFO and send.
+
+                cmp #FNF_REQUESTS_END
+                bcc _send        ;is a F&F request. Send.
+                
+                ; not a F&F request. Drain fifo and send.
+_drain:
+                .if debug_markers
+                lda #'D'
+                jsr debug_write_a
+                lda link_last_status_byte
+                jsr debug_write_a
+                .endif
+                
+                ; If no speculative responses expected, nothing to
+                ; drain.
+                lda link_last_status_byte
+                cmp #SERIAL_STATUS_SPECULATIVE_FOLLOWS
+                bne _send
+
+                txa
+                pha
+                tya
+                pha
+
+                lda payload_counter+0
+                pha
+                lda payload_counter+1
+                pha
+                lda payload_counter+2
+                pha
+                lda payload_counter+3
+                pha
+
+_drain_loop:
+                jsr recv_response_and_discard_payload
+
+                lda link_last_status_byte
+                cmp #SERIAL_STATUS_SPECULATIVE_FOLLOWS
+                beq _drain_loop
+
+                pla
+                sta payload_counter+3
+                pla
+                sta payload_counter+2
+                pla
+                sta payload_counter+1
+                pla
+                sta payload_counter+0
+
+                pla
+                tay
+                pla
+                tax
+
+_send:
                 .if send_1_byte_messages
                 
                 ; payload size 1?
                 lda payload_counter+0
                 cmp #1
-                bne n_bytes     ;taken if payload size isn't $xxxxxx01
+                bne _n_bytes    ;taken if payload size isn't $xxxxxx01
 
                 lda payload_counter+1
                 ora payload_counter+2
                 ora payload_counter+3
-                bne n_bytes     ;taken if payload size isn't $00000001
+                bne _n_bytes    ;taken if payload size isn't $00000001
 
                 pla             ;restore packet type
                 and #$7f        ;clear the N-byte bit
@@ -331,7 +729,7 @@ begin_send: .proc
 
                 .endif
 
-n_bytes:
+_n_bytes:
                 pla             ;restore packet type
                 ora #$80        ;set the N-byte bit
                 jsr send_header_byte ;send header type
@@ -350,13 +748,106 @@ n_bytes:
 
                 clc
                 rts
-                .pend
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+; 
+;
+drain_rx_fifo: .proc
+                ; .debug_print ['ts: drain\r\n']
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
+drain:
+                lda #status.rx_data
+drain_loop:
+                bit fifo        ;doesn't matter if this underflows...
+                bit status
+                bne drain_loop
+                rts
+
+                .if !target_electron
+itu:
+                php
+                jsr itu_sei_ext_tube
+                jsr drain
+                jsr itu_int_tube
+                plp
+                rts
+                .endif
+                .endproc
+                
+;-------------------------------------------------------------------------
+;
+; Poll for recv
+;
+; exit: C=0 - receive FIFO empty
+;       C=1 - receive FIFO not empty
+
+poll_recv: .proc
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
+
+                lda status
+check_status:
+                and #status.rx_data
+                cmp #status.rx_data
+                rts
+
+                .if !target_electron
+itu:
+                .cpu '65c02'
+                php
+                jsr itu_sei_ext_tube
+                ldx status
+                jsr itu_int_tube
+                plp
+                txa
+                bra check_status
+                .cpu 'default'
+                .endif
+                .endproc
+
 
 ;-------------------------------------------------------------------------
 ;
 ; Begin recv.
 
 begin_recv: .proc
+                .if use_placeholder_requests
+                
+                lda #<reasonable_wait_time
+                jsr set_payload_counter
+                lda #>reasonable_wait_time
+                sta payload_counter+1
+
+                jsr negate_payload_counter
+
+                ; ~65 (xtu)/125 (itu)
+wait_loop:
+                jsr poll_recv   ;+20 (xtu)/80 itu
+                bcs got_data    ;+2
+
+                jsr inc_payload_counter ;+20
+                bne wait_loop           ;+23
+
+                ; Blegh. Timed out. Prod the server and see if that
+                ; helps.
+                lda #REQUEST_TUBE_SERIAL_PLACEHOLDER
+                jsr send_header_byte
+
+                ; Only do it the once. Either it worked, or it didn't.
+                
+got_data:
+                .endif
+
+                lda #SERIAL_STATUS_NOT_RECEIVED
+                sta link_last_status_byte
+                
                 jsr recv_header_byte ;receive packet type
 
                 cmp #$80        ;C=1 if N-byte
@@ -382,7 +873,7 @@ n_bytes:
                 
                 rts
                 
-                .pend
+                .endproc
                 
 ;-------------------------------------------------------------------------
 ;
@@ -391,15 +882,15 @@ n_bytes:
 ; (Nothing needs to be done for the Tube serial.)
 unprepare: .proc
                 rts
-                .pend
+                .endproc
 
 ;-------------------------------------------------------------------------
 ;
 ; Placeholder for stuff I haven't done yet.
 ;
 error: .proc
-                .brk_error 255,'Myelin serial transfer = TODO'
-                .pend
+                .brk_error 255,'Tube serial transfer = TODO'
+                .endproc
 
 ;-------------------------------------------------------------------------
 ;
@@ -407,9 +898,74 @@ error: .proc
 ;
 nop: .proc
                 rts
-                .pend
+                .endproc
 
-        
+;-------------------------------------------------------------------------
+;
+; Select int Tube.
+;
+; exit: int Tube selected
+; preserves: X/y
+itu_int_tube: .proc
+                .cpu '65c02'
+                lda #acccon.itu
+                tsb acccon
+                rts
+                .cpu 'default'
+                .endproc
+                
+;-------------------------------------------------------------------------
+;
+; Selects int Tube, enables IRQs, disables IRQs, then re-selects
+; ext tube.
+;
+; exit: I=1
+;       ext Tube selected
+; preserves: X/Y
+itu_cli_briefly: .proc
+                jsr itu_int_tube
+                cli
+                jmp itu_sei_ext_tube
+                ;.cerror *!=itu_sei_ext_tube,'oops'
+                .endproc
+                
+;-------------------------------------------------------------------------
+;
+; Disable IRQs and select ext Tube.
+;
+; Call takes 22 cycles.
+;
+; exit: I=1
+;       ext Tube selected
+; preserves: X/Y
+itu_sei_ext_tube: .proc
+                .cpu '65c02'
+                sei             ;6 +2
+                lda #acccon.itu ;8 +2
+                trb acccon      ;10 +6
+                rts             ;16 +6 = 22
+                .cpu 'default'
+                .endproc
+
+;-------------------------------------------------------------------------
+; 
+; Wait for the RX data/TX space status flag to become set. Keeps IRQs
+; enabled as much as possible.
+;
+; entry:
+; exit: I=1
+;       FIFO in hoped-for state
+;       ext Tube selected
+                .if !target_electron
+itu_wait_for_status: .proc
+                pha
+                jsr itu_cli_briefly
+                pla
+                bit status
+                beq itu_wait_for_status
+                rts
+                .endproc
+                .endif
                 
 ;-------------------------------------------------------------------------
 ;
@@ -420,13 +976,25 @@ nop: .proc
 send_byte: .macro
                 .txdp ['send_byte: sending &',DP_Y]
 
+                .if debug_markers
+                jsr debug_write_s_marker
+                .endif
+
                 lda #status.tx_space
 -
+                .if target_electron
+                ; lda #status.tx_space ;yep, wtf
+                .endif
                 bit status
                 beq -
-                sty fifo
+                .sty_fifo
+
+                .if debug_markers
+                jsr debug_write_y
+                .endif
+                
                 .txdp ['\r\n']
-                .endm
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -438,23 +1006,132 @@ send_byte: .macro
 
 recv_byte: .macro
                 .txdp ['recv_byte: received &']
+
+                .if debug_markers
+                jsr debug_write_r_marker
+                .endif
+                
                 lda #status.rx_data
 -
+                .if target_electron
+                ; lda #status.tx_space ;yep, wtf
+                .endif
                 bit status
                 beq -
                 lda fifo
-                .txdp [DP_A,'\r\n']
-                .endm
+
+                .if debug_markers
+                jsr debug_write_a
+                .endif
                 
+                .txdp [DP_A,'\r\n']
+                .endmacro
+                
+;-------------------------------------------------------------------------
+;
+; Send a byte on Master 128 when the internal Tube is active.
+;
+; The loop is arranged so it doesn't just spin with interrupts
+; disabled the whole time. This makes it less efficient than necessary
+; when it loops, but the assumption is that this will be quite rare.
+;
+; entry: Y = value to send
+; preserves: X
+itu_send_byte: .macro
+                .txdp ['itu_send_byte: sending &',DP_Y]
+                .cpu '65c02'
+                .if debug_markers
+                jsr debug_write_s_marker
+                .endif
+-
+                php
+                sei
+                lda #acccon.itu
+                trb acccon
+                lda status
+                and #status.tx_space
+                bne +
+                lda #acccon.itu
+                tsb acccon
+                plp
+                bra -
++
+                .sty_fifo
+                .if debug_markers
+                jsr debug_write_y
+                .endif
+                lda #acccon.itu
+                tsb acccon
+                plp
+                .txdp ['\r\n']
+                .cpu 'default'
+                .endmacro
+
+;-------------------------------------------------------------------------
+;
+; Receive a byte on Master 128 when the internal Tube is active.
+;
+; exit: if \dest>=0, ?\dest = byte received
+; preserves: X/Y
+itu_recv_byte: .macro dest
+                .txdp ['itu_recv_byte: received ']
+                .cpu '65c02'
+                .if debug_markers
+                jsr debug_write_r_marker
+                .endif
+-
+                php
+                sei
+                lda #acccon.itu
+                trb acccon
+                lda status
+                and #status.rx_data
+                bne +
+                lda #acccon.itu
+                tsb acccon
+                plp
+                bra -
++
+                lda fifo
+                .if debug_markers
+                jsr debug_write_a
+                .endif
+                .if \dest>=0
+                sta \dest
+                .endif
+                lda #acccon.itu
+                tsb acccon
+                plp
+                .if \dest>=0
+                .txdp ['&',\dest,'\r\n']
+                .else
+                .txdp ['??\r\n']
+                .endif
+                .cpu 'default'
+                .endmacro
+
 ;-------------------------------------------------------------------------
 
 send_header_byte: .proc
                 sty link_old_y
                 tay
-                
+
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
+
                 .send_byte
                 ldy link_old_y
                 rts
+
+                .if !target_electron
+itu:
+                .itu_send_byte
+                ldy link_old_y
+                rts
+                .endif
+                .endproc
 
 ;-------------------------------------------------------------------------
 
@@ -462,7 +1139,12 @@ send_payload_byte: .proc
                 sty link_old_y
                 
                 tay
-            
+
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
+
                 .send_byte
 
                 lda payload_counter+0
@@ -475,17 +1157,49 @@ send_payload_byte: .proc
                 ldy link_old_y
                 rts
 
+                .if !target_electron
+itu:
+                .itu_send_byte
+
+                lda payload_counter+0
+                bne +
+
+                ldy #1
+                .itu_send_byte
+
++
+                ldy link_old_y
+                rts
+                .endif
+                .endproc
+
 ;-------------------------------------------------------------------------
 
 recv_header_byte: .proc
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
                 
                 ; receive data byte
                 .recv_byte
                 rts
 
+                .if !target_electron
+itu:
+                .itu_recv_byte link_value
+                lda link_value
+                rts
+                .endif
+                .endproc
+
 ;-------------------------------------------------------------------------
 
 recv_payload_byte: .proc
+                .if !target_electron
+                bit link_itu
+                bmi itu
+                .endif
 
                 lda payload_counter+0
                 beq recv_status_byte
@@ -499,121 +1213,150 @@ recv_status_byte:
                 pha             ;save data byte
 
                 .recv_byte
+                sta link_last_status_byte
 
                 pla             ;restore data byte
                 rts
 
-
-;-------------------------------------------------------------------------
-;
-; Transfer mode stuff.
-;
-
-; Fake enum. Supply these to the dir argument of any of the
-; transfer-related macros.
-send=1
-recv=2
-
-; Crude dir validity check.
-check_dir: .macro dir
-                .cerror \dir!=send&&\dir!=recv,'bad send/recv dir'
-                .endm
-
-; Get appropriate status register flag for dir.
-get_status_flag_for_dir: .function dir
-                .check_dir dir
-                .endf dir==send?status.tx_space:status.rx_data
-                
-;-------------------------------------------------------------------------
-;
-; Generates driver routine for transferring file data. Sends N lead-up
-; bytes, followed by a confirmation byte; then some number of pages,
-; each followed by a confirmation byte.
-;
-; If \tube_dir is 0, no Tube code will be generated; if send or recv,
-; Tube handling will be included.
-;
-; \bytes_routine is the bytes transfer routine to call.
-;
-; \page_routine is the page transfer routine to call. If 0,
-; \bytes_routine will be called instead, with X=0 each time, to
-; transfer 256 bytes.
-; 
-transfer_file_data_driver_routine: .macro tube_dir,bytes_routine,page_routine,name
-                .if \tube_dir!=0
-                .check_dir \tube_dir
-                jsr claim_tube
-                .endif
-
-                jsr negate_payload_counter
-                
-                .txdp [\name,': &',payload_counter+0,' bytes, &',payload_counter+3,payload_counter+2,payload_counter+1,' pages\r\n']
-
-                ; need to copy any bytes?
+                .if !target_electron
+itu:
                 lda payload_counter+0
-                beq bytes_done
+                beq itu_recv_status_byte
 
-                .if \tube_dir!=0
-                ldx #<payload_addr
-                ldy #>payload_addr
-                lda #\tube_dir==send?tube_multi_byte_parasite_to_host:tube_multi_byte_host_to_parasite
-                jsr $406
+itu_recv_data_byte:
+                .itu_recv_byte link_value
+                lda link_value
+                rts
+
+itu_recv_status_byte:
+                jsr itu_recv_data_byte
+                .itu_recv_byte link_last_status_byte
+                lda link_value
+                rts
                 .endif
+                .endproc
+
+;-------------------------------------------------------------------------
+
+recv_file_data_host: .proc
+                lda #$81        ;host, recv
+                jmp transfer_file_data
+                .endproc                
+                
+send_file_data_host: .proc
+                lda #$80        ;host, send
+                jmp transfer_file_data
+                .endproc
+
+recv_file_data_parasite: .proc
+                lda #$01        ;parasite, recv
+                jmp transfer_file_data
+                .endproc
+
+send_file_data_parasite: .proc
+                lda #$00        ;parasite, send
+                jmp transfer_file_data
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+; Transfer file data.
+;
+; Entry:
+;
+; !payload_addr - host or parasite address
+;
+; !payload_counter - negated number of bytes to send
+;
+; A = transfer flags: b7 = 1 = transfer to/from host
+;                          0 = transfer to/from parasite
+;                     b0 = 1 = recv (if parasite, host->parasite)
+;                          0 = send (if parasite, parasite->host)
+transfer_file_data: .proc
+                sta link_transfer_flags
+
+                ; Form routine index from the transfer flags.
+                ;
+                ; (link_itu is currently bit 7 only. But that might
+                ; change.)
+                .if target_electron
+                lda #0                  ;I=0
+                .else
+                lda link_itu            ;? I???????
+                .endif
+                asl a                   ;I ????????
+                lda link_transfer_flags ;I H000000R
+                rol a                   ;H 000000RI
+                rol a                   ;0 00000RIH
+                asl a                   ;0 0000RIH0 (b0 = page flag)
+                pha                     ;save routine index
+
+                ; .debug_print ['tfd: routine=',DP_A,' -count=&',payload_counter+3,payload_counter+2,payload_counter+1,payload_counter+0,'\r\n']
+
+                ; Claim Tube if necessary.
+                lda link_transfer_flags ;N=0 if Tube
+                bmi tube_claimed
+                jsr claim_tube
+tube_claimed:
+                jsr negate_payload_counter
+
+                ; Need to copy any bytes?
+                lda payload_counter+0
+                beq bytes_done  ;taken if only pages
+
+                pla             ;restore routine index
+                pha             ;save routine index
+                tax
+                jsr init_link_transfer_thunk
+                
+                lda #tube_multi_byte
+                jsr initiate_tube_transfer
 
                 ldx payload_counter+0
-                jsr \bytes_routine
+                jsr link_transfer_thunk
 
                 ; update dest pointer
                 clc
                 lda payload_addr+0
                 adc payload_counter+0
                 sta payload_addr+0
-                bcc +
+                bcc payload_addr_updated_for_bytes
                 inc payload_addr+1
-                bne +
+                bne payload_addr_updated_for_bytes
                 inc payload_addr+2
-                bne +
+                bne payload_addr_updated_for_bytes
                 inc payload_addr+3
-+
+payload_addr_updated_for_bytes:
 
 bytes_done:
-                ; need to copy any pages?
+                ; Always set up page routine index, so as to consume
+                ; the saved byte.
+                pla             ;restore routine index
+                tax
+                inx             ;set page flag bit
+                jsr init_link_transfer_thunk
+
+                ; Need to copy any pages?
                 lda #0
                 sta payload_counter+0
                 jsr test_payload_counter
-                beq done
+                beq transfer_done
 
                 jsr negate_payload_counter
                 ; payload_counter bits 8-31 is the negative page
                 ; count.
 pages_loop:
-                .if \page_routine!=0
-                
-                .if \tube_dir!=0
-                ldx #<payload_addr
-                ldy #>payload_addr
-                lda #\tube_dir==send?tube_256_byte_parasite_to_host:tube_256_byte_host_to_parasite
-                jsr $406
-                .endif
+                lda #tube_256_byte
+                jsr initiate_tube_transfer
 
-                jsr \page_routine
-                
-                .else
-
-                ; (can continue to use existing Tube transfer mode, if
-                ; any)
-                
-                ldx #0          ;transfer 256 bytes
-                jsr \bytes_routine
-                
-                .endif
+                jsr link_transfer_thunk
 
                 inc payload_addr+1
-                bne +
+                bne payload_addr_updated_for_page
                 inc payload_addr+2
-                bne +
+                bne payload_addr_updated_for_page
                 inc payload_addr+3
-+
+payload_addr_updated_for_page:
 
                 inc payload_counter+1 ;page count bits 0-7
                 bne pages_loop
@@ -621,15 +1364,74 @@ pages_loop:
                 bne pages_loop
                 inc payload_counter+3 ;page count bits 16-23
                 bne pages_loop
-                
-done:
-                .if \tube_dir!=0
-                jsr release_tube
-                .endif
 
+transfer_done:
+                lda link_transfer_flags ;N=0 if Tube
+                bmi tube_released
+                jsr release_tube
+tube_released:
                 rts
 
-                .endm
+                ; Set up the transfer thunk.
+init_link_transfer_thunk:
+                lda #$4c
+                sta link_transfer_thunk+0
+                lda link_transfer_routines_lsb,x
+                sta link_transfer_thunk+1
+                lda link_transfer_routines_msb,x
+                sta link_transfer_thunk+2
+                ; .debug_print ['Transfer thunk: ',link_transfer_thunk+0,link_transfer_thunk+1,link_transfer_thunk+2,' (idx=&',DP_X,')\r\n']
+                rts
+
+                ; Initiate a Tube transfer, if necessary.
+initiate_tube_transfer:
+                ora link_transfer_flags ;N=0 if Tube
+                bpl +           ;taken if Tube transfer wanted
+                rts
++
+                ; .debug_print ['Tube transfer: mode=&',DP_A,' addr=&',payload_addr+3,payload_addr+2,payload_addr+1,payload_addr+0,'\r\n']
+                ldx #<payload_addr
+                ldy #>payload_addr
+                jmp $406
+
+_:=[]
+_..=[send_parasite_bytes]       ; R=0 I=0 H=0 p=0 $0
+_..=[send_parasite_page]        ; R=0 I=0 H=0 p=1 $1
+_..=[send_host_bytes]           ; R=0 I=0 H=1 p=0 $2
+_..=[send_host_page]            ; R=0 I=0 H=1 p=1 $3
+                .if target_electron
+_..=[not_implemented,not_implemented,not_implemented,not_implemented]
+                .else
+_..=[itu_send_parasite_bytes]   ; R=0 I=1 H=0 p=0 $4
+_..=[itu_send_parasite_page]    ; R=0 I=1 H=0 p=1 $5
+_..=[itu_send_host_bytes]       ; R=0 I=1 H=1 p=0 $6
+_..=[itu_send_host_page]        ; R=0 I=1 H=1 p=1 $7
+                .endif
+_..=[recv_parasite_bytes]       ; R=1 I=0 H=0 p=0 $8
+_..=[recv_parasite_page]        ; R=1 I=0 H=0 p=1 $9
+_..=[recv_host_bytes]           ; R=1 I=0 H=1 p=0 $a
+_..=[recv_host_page]            ; R=1 I=0 H=1 p=1 $b
+                .if target_electron
+_..=[not_implemented,not_implemented,not_implemented,not_implemented]
+                .else
+_..=[itu_recv_parasite_bytes]   ; R=1 I=1 H=0 p=0 $c
+_..=[itu_recv_parasite_page]    ; R=1 I=1 H=0 p=1 $d
+_..=[itu_recv_host_bytes]       ; R=1 I=1 H=1 p=0 $e
+_..=[itu_recv_host_page]        ; R=1 I=1 H=1 p=1 $f
+                .endif
+link_transfer_routines=_
+                .cerror len(link_transfer_routines)!=16,'oops'
+link_transfer_routines_lsb: .byte <link_transfer_routines
+link_transfer_routines_msb: .byte >link_transfer_routines
+                
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+;
+not_implemented: .proc
+                .brk_error 255,'Internal error (ITU)'
+                .endproc
 
 ;-------------------------------------------------------------------------
 ;
@@ -647,8 +1449,26 @@ transfer_wait_for_status: .macro dir
 -
                 bit status
                 beq -
-                .endm
+                .endmacro
 
+;-------------------------------------------------------------------------
+;
+; Generate code to wait for appropriate FIFO readiness for the given
+; direction.
+;
+; 9 cycles when straight through.
+;
+; exit: FIFO in hoped-for state
+; preserves: X/Y
+itu_transfer_wait_for_status: .macro dir
+                .check_dir \dir
+
+                lda #get_status_flag_for_dir(\dir)
+                bit status
+                bne +
+                jsr itu_wait_for_status
++
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -666,13 +1486,21 @@ transfer_host_data_byte: .macro dir
                 
                 .if \dir==send
                 lda (payload_addr),y
-                sta fifo
+                .sta_fifo
+                .if debug_markers
+                jsr debug_write_s_marker
+                jsr debug_write_a
+                .endif
                 .else
                 lda fifo
                 sta (payload_addr),y
+                .if debug_markers
+                jsr debug_write_r_marker
+                jsr debug_write_a
+                .endif
                 .endif
                 
-                .endm
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -689,14 +1517,22 @@ transfer_parasite_data_byte: .macro dir
                 .check_dir \dir
 
                 .if \dir==send
-                ldy tube_fifo3_data
-                sty fifo
+                ldy tube.fifo3_data
+                .sty_fifo
+                .if debug_markers
+                jsr debug_write_s_marker
+                jsr debug_write_y
+                .endif
                 .else
                 ldy fifo
-                sty tube_fifo3_data
+                sty tube.fifo3_data
+                .if debug_markers
+                jsr debug_write_r_marker
+                jsr debug_write_y
+                .endif
                 .endif
 
-                .endm
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -709,12 +1545,21 @@ transfer_status_byte: .macro dir
 
                 .if \dir==send
                 lda #1
-                sta fifo
+                .sta_fifo
+                .if debug_markers
+                jsr debug_write_s_marker
+                jsr debug_write_a
+                .endif
                 .else
-                lda fifo        ;and discard it
+                lda fifo
+                sta link_last_status_byte
+                .if debug_markers
+                jsr debug_write_r_marker
+                jsr debug_write_a
+                .endif
                 .endif
 
-                .endm
+                .endmacro
                 
 ;-------------------------------------------------------------------------
 ;
@@ -737,8 +1582,33 @@ loop:
 
                 rts
                 
-                .endm
+                .endmacro
 
+;-------------------------------------------------------------------------
+;
+; Generate ITU=1 host bytes transfer routine.
+;
+itu_transfer_host_bytes_routine: .macro dir
+                .check_dir \dir
+
+                ldy #0
+                php
+                jsr itu_sei_ext_tube
+loop:
+                .itu_transfer_wait_for_status \dir ;0 +9
+                .transfer_host_data_byte \dir      ;9 +10
+
+                iny             ;19 +2
+                dex             ;21 +2
+                bne @b loop     ;23 +3 = 26
+
+                .itu_transfer_wait_for_status \dir
+                .transfer_status_byte \dir
+
+                jsr itu_int_tube
+                plp
+                rts
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -756,16 +1626,55 @@ loop:
                 .transfer_wait_for_status \dir ;+8  8
                 .transfer_host_data_byte \dir  ;+10 18
                 iny                            ;+2  20
-                .next                          ;20n
+                .endrept                       ;20n
 
+                .if debug_markers
                 bne loop
-
+                .else
+                bne @b loop
+                .endif
+                
                 .transfer_wait_for_status \dir
                 .transfer_status_byte \dir
 
                 rts
                 
-                .endm
+                .endmacro
+
+;-------------------------------------------------------------------------
+;
+; Generate ITU=1 host page transfer routine.
+;
+itu_transfer_host_page_routine: .macro dir
+                .cpu '65c02'
+                .check_dir \dir
+
+bytes_per_iteration=8
+                .cerror 256%bytes_per_iteration!=0,'no'
+
+                ldy #0
+                php
+
+                jsr itu_sei_ext_tube
+
+loop:
+                .rept bytes_per_iteration
+                .itu_transfer_wait_for_status \dir ;0 +9
+                .transfer_host_data_byte \dir      ;9 +10
+                iny                                ;19 +2
+                .endrept                           ;21n
+
+                bne loop
+
+                .itu_transfer_wait_for_status \dir
+                .transfer_status_byte \dir
+
+                jsr itu_int_tube
+                plp
+                rts
+                
+                .cpu 'default'
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -774,7 +1683,7 @@ loop:
 ; Min 24 usec/48 cycles per byte.
 ;
 ; entry: Tube FIFO ready for transfer mode 0/1
-;        (recv) X+1 bytes incoming - X data bytes, 1 confirmation byte
+;        (recv) X+1 bytes incoming - X data bytes, 1 status byte
 transfer_parasite_bytes_routine: .macro dir
                 .check_dir \dir
 
@@ -785,20 +1694,22 @@ transfer_parasite_bytes_routine: .macro dir
                 nop             ;6 +2
                 bit $70         ;8 +3
                 .endif
-                
+
+                .page                
 loop:
                 .transfer_wait_for_status \dir    ;0 +8
                 jsr delay_24_cycles               ;8 +24
                 bit $70                           ;32 +3
                 .transfer_parasite_data_byte \dir ;35 +8
                 dex                               ;43 +2
-                bne loop                          ;45 +3
-
+                bne @b loop                       ;45 +3
+                .endpage
+                
                 .transfer_wait_for_status \dir
                 .transfer_status_byte \dir
                 
                 rts
-                .endm
+                .endmacro
 
 ;-------------------------------------------------------------------------
 ;
@@ -821,7 +1732,8 @@ transfer_parasite_page_routine: .macro dir
                 .endif
 
                 ldx #0                             ;+2 
-                lda #get_status_flag_for_dir(\dir) ;+2 
+                lda #get_status_flag_for_dir(\dir) ;+2
+                .page
 loop:
                 bit status                        ;+4 4
                 bne transfer                      ;+3 7
@@ -829,161 +1741,400 @@ loop:
 transfer:                                         ;...
                 .transfer_parasite_data_byte \dir ;+8 15
                 inx                               ;+2 17
-                bne loop                          ;+3 20
-
+                bne @b loop                       ;+3 20
+                .endpage
+                
                 .transfer_wait_for_status \dir
                 .transfer_status_byte \dir
                 
                 rts
-                .endm
-                
+                .endmacro
+
 ;-------------------------------------------------------------------------
 ;
-; Instantiations of the various macro-generated transfer routines, and
-; some hand-written stuff.
+; ITU=1 host->parasite bytes transfer.
 ;
-; This is all just in any old order, whatever's necessary to fit each
-; routine into 1 page so that the branch cycle counts are predictable
-; :(
+itu_recv_parasite_bytes: .proc
+                .cpu '65c02'
+                php
+                jsr itu_sei_ext_tube
 
-;-------------------------------------------------------------------------
-
-                .align 256
+loop:
+                .if debug_markers
+                jsr debug_write_r_marker
+                .endif
+                lda #get_status_flag_for_dir(send) ;0 +2
+                bit status                         ;2 +4
+                bne +                              ;6 +3
+                jsr itu_wait_for_status            ;...
++                                                  ;
+                ldy fifo                           ;9 +4
+                .if debug_markers
+                jsr debug_write_y
+                .endif
+                lda #acccon.itu                    ;13 +2
+                tsb acccon                         ;15 +6
+                sty tube.fifo3_data                ;21 +4
+                trb acccon                         ;25 +6
+                jsr delay_12_cycles                ;31 +12
+                dex                                ;43 +2
+                bne @b loop                        ;45 +3
                 
+                .itu_transfer_wait_for_status recv
+                .transfer_status_byte recv
+
+                jsr itu_int_tube
+                plp
+                rts
+                .cpu 'default'
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+; ITU=1 parasite->host bytes transfer.
+;
+; The 48 cycle initial delay is included in the setup.
+;
+itu_send_parasite_bytes: .proc
+                .cpu '65c02'
+                php                  ;6 +3
+                jsr itu_sei_ext_tube ;9 +22 = 31
+
+loop:
+                .if debug_markers
+                jsr debug_write_s_marker
+                .endif
+                lda #acccon.itu                    ;0 +2
+                tsb acccon                         ;2 +6
+                ldy tube.fifo3_data                ;8 +4 
+                trb acccon                         ;12 +6
+                lda #get_status_flag_for_dir(send) ;18 +2
+                bit status                         ;20 +4
+                bne +                              ;24 +3
+                jsr itu_wait_for_status            ;
++                                                  ;
+                .sty_fifo                           ;27 +4
+                .if debug_markers
+                jsr debug_write_y
+                .endif
+                jsr delay_12_cycles                ;31 +12
+                dex                                ;43 +2
+                bne @b loop                        ;45 +3
+
+                .itu_transfer_wait_for_status send
+                .transfer_status_byte send
+
+                jsr itu_int_tube
+                plp
+                rts
+                .cpu 'default'
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+; ITU=1 host->parasite page transfer.
+;
+; The extra cycle from any branch page crossing doesn't make a
+; measurable difference.
+; 
+itu_recv_parasite_page: .proc
+                .cpu '65c02'
+                
+bytes_per_iteration=8
+                .cerror (256%bytes_per_iteration)!=0,'no'
+
+                php
+                jsr itu_sei_ext_tube
+                jsr get_acccon
+                
+                lda #256/bytes_per_iteration
+                sta link_value
+
+loop:
+                .rept bytes_per_iteration
+
+                .if debug_markers
+                jsr debug_write_r_marker
+                .endif
+                stx acccon                         ;+4 4
+                lda #get_status_flag_for_dir(recv) ;+2 6
+                bit status                         ;+4 10
+                bne +                              ;+3 13
+                jsr wait_status                    ;...
++                                                  ;...
+                lda fifo                           ;+4 17
+                .if debug_markers
+                jsr debug_write_a
+                .endif
+                sty acccon                         ;+4 21
+                sta tube.fifo3_data                ;+4 25
+
+                .endrept
+
+                dec link_value
+                bne loop
+
+                stx acccon      ;re-select internal Tube
+                .itu_transfer_wait_for_status recv
+                .transfer_status_byte recv
+                
+                jsr itu_int_tube
+
+                plp
+                rts
+
+                ; update ACCCON values on exit, in case they got
+                ; changed
+wait_status:
+                jsr itu_wait_for_status
+get_acccon:
+                lda acccon
+                tax             ;X = ext Tube
+                ora #acccon.itu
+                tay             ;Y = int Tube
+                rts
+                .cpu 'default'
+                .endproc
+
+;-------------------------------------------------------------------------
+;
+; ITU=1 parasite->host page transfer.
+;
+; The 38 cycle initial delay is included in the setup.
+;
+; The extra cycle from any page crossing doesn't make a measurable
+; difference.
+; 
+itu_send_parasite_page: .proc
+                .cpu '65c02'
+bytes_per_iteration=8
+                .cerror (256%bytes_per_iteration)!=0,'no'
+
+                ; Y holds ACCCON with ITU=1.
+                ; ?acccon_xtu = value of ACCCON with ITU=0.
+acccon_xtu=link_old_y
+                
+                php                  ;6 +3
+                jsr itu_sei_ext_tube ;9 +22
+                jsr get_acccon       ;31 +(>=12) = >=38
+
+                lda #256/bytes_per_iteration
+                sta link_value
+
+loop:
+                .rept bytes_per_iteration
+
+                .if debug_markers
+                jsr debug_write_s_marker
+                .endif
+
+                sty acccon                         ;0 +4
+                ldx tube.fifo3_data                ;4 +4
+                lda acccon_xtu                     ;8 +3
+                sta acccon                         ;11 +4
+                lda #get_status_flag_for_dir(send) ;15 +2
+                bit status                         ;17 +4
+                bne +                              ;21 +3
+                jsr wait_status                    ;...
++                                                  ;...
+                .stx_fifo                           ;24 +4 = 28
+                .if debug_markers
+                jsr debug_write_x
+                .endif
+                .endrept
+
+                dec link_value
+                bne loop
+
+                .itu_transfer_wait_for_status send
+                .transfer_status_byte send
+                
+                jsr itu_int_tube
+                plp
+                rts
+
+                ; update ACCCON values on exit, in case they got
+                ; changed
+wait_status:
+                jsr itu_wait_for_status
+get_acccon:
+                lda acccon
+                sta acccon_xtu  ;?acccon_xtu = ext Tube
+                ora #acccon.itu
+                tay             ;Y = int tube
+                rts
+                .cpu 'default'
+                .endproc
+
+
+;-------------------------------------------------------------------------
+;
+; Instantiations of the macro-generated transfer routines.
+;
 ;-------------------------------------------------------------------------
 
-                .page
+; These aren't a bottleneck.
+                
 recv_host_bytes: .proc
                 .transfer_host_bytes_routine recv
-                .pend
-                .endp
+                .endproc
 
-                .page
 send_host_bytes: .proc
                 .transfer_host_bytes_routine send
-                .pend
-                .endp
+                .endproc
+
+; These are unrolled 8x, and the extra cycle from any page crossing
+; doesn't make a measurable difference.
                 
-                .page
-itu_recv_host_bytes: .proc
-                .itu_transfer_host_bytes_routine recv
-                .pend
-                .endp
+recv_host_page: .proc
+                .transfer_host_page_routine recv
+                .endproc
 
-                .page
-itu_send_host_bytes: .proc
-                .itu_transfer_host_bytes_routine send
-                .pend
-                .endp
-
-                .page
-recv_parasite_bytes: .proc
-                .transfer_parasite_bytes_routine recv
-                .pend
-                .endp
-
-                .page
-send_parasite_bytes: .proc
-                .transfer_parasite_bytes_routine send
-                 .pend
-                .endp
-
-;-------------------------------------------------------------------------
-
-                .align 256
-                
-;-------------------------------------------------------------------------
-
-                .page
 send_host_page: .proc
                 .transfer_host_page_routine send
-                .pend
-                .endp
+                .endproc
 
-                .align 256
+;-------------------------------------------------------------------------
+
+; These aren't a bottleneck.
                 
-                .page
+itu_recv_host_bytes: .proc
+                .itu_transfer_host_bytes_routine recv
+                .endproc
+
+itu_send_host_bytes: .proc
+                .itu_transfer_host_bytes_routine send
+                .endproc
+
+; These are unrolled 8x, and have a 64tass long branch. So no
+; alignment restrictions.
+                
 itu_recv_host_page: .proc
                 .itu_transfer_host_page_routine recv
-                .pend
-                .endp
+                .endproc
 
-                .align 256
-
-                .page
 itu_send_host_page: .proc
                 .itu_transfer_host_page_routine send
-                .pend
-                .endp
+                .endproc
 
-                .page
-recv_parasite_page: .proc
-                .transfer_parasite_page_routine recv
-                .pend
-                .endp
+;-------------------------------------------------------------------------
 
-                .page
+; These 4 routines are somewhat carefully timed, and have branches
+; that shouldn't cross a page boundary.
+;
+; Luckily, they're all quite short, and the region of interest will
+; fit... just... into 128 bytes. The page routines are key, but no
+; harm in having the bytes routine a bit faster too.
+;
+; SPEEDTEST results with no page crossings:
+                
+; Parasite<->server: 245,760 bytes in 10 tests
+;     BBC->PC: 89.2 KBytes/sec
+;     PC->BBC: 88.2 KBytes/sec
+                
+; With 100% page crossings:
+                
+; Parasite<->server: 245,760 bytes in 10 tests
+;     BBC->PC: 85.2 KBytes/sec
+;     PC->BBC: 84.2 KBytes/sec
+                
+                .align 64
+send_parasite_bytes: .proc
+                .transfer_parasite_bytes_routine send
+                 .endproc
+
+                .align 64
 send_parasite_page: .proc
                 .transfer_parasite_page_routine send
-                .pend
-                .endp
+                .endproc
 
+                .align 64
+recv_parasite_page: .proc
+                .transfer_parasite_page_routine recv
+                .endproc
 
-recv_file_data_host: .proc
+                .align 64
+recv_parasite_bytes: .proc
+                .transfer_parasite_bytes_routine recv
+                .endproc
 
-                .transfer_file_data_driver_routine 0,recv_host_bytes,recv_host_page,'recv_file_data_host'
+;-------------------------------------------------------------------------
+
+                .if tube_serial_safe
+
+; addresses of the form $xxx0 seem to be safe.
+
+                .align 16
+sta_fifo_helper:
+                sta fifo
+                rts
+
+                .align 16
+stx_fifo_helper:
+                stx fifo
+                rts
+
+                .align 16
+sty_fifo_helper:
+                sty fifo
+                rts
                 
-                .pend
-
-send_file_data_host: .proc
-
-                .transfer_file_data_driver_routine 0,send_host_bytes,send_host_page,'send_file_data_host'
-
-                .pend
-
-recv_file_data_parasite: .proc
-
-                .transfer_file_data_driver_routine recv,recv_parasite_bytes,recv_parasite_page,'recv_file_data_parasite'
-
-                .pend
-
-send_file_data_parasite: .proc
-
-                .transfer_file_data_driver_routine send,send_parasite_bytes,send_parasite_page,'send_file_data_parasite'
-
-                .pend
+                .endif
                 
 ;-------------------------------------------------------------------------
 
-                .bend
-                
-                .send code
+                .endblock
 
 ;-------------------------------------------------------------------------
-                
-link_name='Myelin Serial'
-link_subtype=SERIAL_SUBTYPE_MYELIN_SERIAL
-                
-link_unprepare=myelin_serial.unprepare
 
-link_begin_send_without_restart=myelin_serial.begin_send
-link_begin_send_with_restart=myelin_serial.begin_send
-
-link_begin_recv=myelin_serial.begin_recv
+                .if target_electron&&!tube_serial_safe
                 
-link_send_payload_byte=myelin_serial.send_payload_byte
-link_recv_payload_byte=myelin_serial.recv_payload_byte
+link_beeb_name='Tube Serial (Electron+AP5)'
+link_beeb_type=LINK_BEEB_TYPE_TUBE_SERIAL_ELECTRON
                 
-link_startup=myelin_serial.startup
-link_status_text=myelin_serial.status_text
+                .elsif target_electron&&tube_serial_safe
                 
-link_send_file_data_parasite=myelin_serial.send_file_data_parasite
+link_beeb_name='Tube Serial (Safe) (Electron+AP5)'
+link_beeb_type=LINK_BEEB_TYPE_TUBE_SERIAL_SAFE_ELECTRON
+                
+                .elsif !target_electron&&!tube_serial_safe
+                
+link_beeb_name='Tube Serial'
+link_beeb_type=LINK_BEEB_TYPE_TUBE_SERIAL
+                
+                .elsif !target_electron&&tube_serial_safe
+                
+link_beeb_name='Tube Serial (Safe)'
+link_beeb_type=LINK_BEEB_TYPE_TUBE_SERIAL_SAFE
 
-link_send_file_data_host=myelin_serial.send_file_data_host
+                .endif
+                
+link_unprepare=tube_serial.unprepare
 
-link_recv_file_data_parasite=myelin_serial.recv_file_data_parasite
+link_begin_send_without_restart=tube_serial.begin_send_without_restart
+link_begin_send_with_restart=tube_serial.begin_send_with_restart
 
-link_recv_file_data_host=myelin_serial.recv_file_data_host
+link_begin_recv=tube_serial.begin_recv
+
+link_poll_recv=tube_serial.poll_recv
+                
+;link_begin_recv=tube_serial.nop
+
+; link_send_header_byte=tube_serial.send_header_byte
+link_send_payload_byte=tube_serial.send_payload_byte
+; link_recv_header_byte=tube_serial.recv_header_byte
+link_recv_payload_byte=tube_serial.recv_payload_byte
+                
+link_startup=tube_serial.startup
+link_status_text=tube_serial.status_text
+                
+link_send_file_data_parasite=tube_serial.send_file_data_parasite
+
+link_send_file_data_host=tube_serial.send_file_data_host
+
+link_recv_file_data_parasite=tube_serial.recv_file_data_parasite
+
+link_recv_file_data_host=tube_serial.recv_file_data_host
 
 link_num_speedtest_iterations=10
 

@@ -141,11 +141,8 @@ _tube_serial_electron_rom: _dest $(DEST)/beeblink_constants.s65
 
 .PHONY : myelin_serial_rom
 _myelin_serial_rom : _dest $(DEST)/beeblink_constants.s65
-	$(MAKE) _rom "BUILD_TIME=$(BUILD_TIME)" ROM_SUFFIX=myelin_serial ROM_BEEB_NAME=MY LINK=myelin_serial CMD_PREFIX=MY
+	$(_V)$(MAKE) _rom "BUILD_INFO=$(BUILD_INFO)" ROM_SUFFIX=tube_myelin ROM_BEEB_NAME=MY LINK=myelin_serial CMD_PREFIX=TS
 
-.PHONY : myelin_serial_rom
-_myelin_serial_rom : _dest $(DEST)/beeblink_constants.s65
-	$(MAKE) _rom "BUILD_TIME=$(BUILD_TIME)" ROM_SUFFIX=myelin_serial ROM_BEEB_NAME=MY LINK=myelin_serial CMD_PREFIX=MY
 
 ##########################################################################
 ##########################################################################

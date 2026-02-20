@@ -370,6 +370,7 @@ rom_copyright:
 link_avr=false
 link_tube_serial=false
 link_tube_serial_electron=false
+link_myelin_serial=false
 link_upurs=false
 link_b2=false
                 .endweak
@@ -391,6 +392,8 @@ link_poll_recv:
                 .include "avr.s65"
                 .elsif link_tube_serial
                 .include "tube_serial.s65"
+                .elsif link_myelin_serial
+                .include "myelin_serial.s65"
                 .elsif link_upurs
                 .include "upurs.s65"
                 .elsif link_b2
